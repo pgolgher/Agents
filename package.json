@@ -7,20 +7,22 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
+    "download": "ts-node src/agents/downloadAgent.ts",
     "lint": "eslint src --ext .ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.38.0",
-    "dotenv": "^16.4.7",
     "axios": "^1.7.9",
     "cheerio": "^1.0.0",
+    "dotenv": "^16.4.7",
     "pdf-parse": "^1.1.1",
+    "playwright": "^1.58.2",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
     "@types/pdf-parse": "^1.1.4",
-    "typescript": "^5.7.3",
-    "ts-node": "^10.9.2"
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.3"
   }
 }
