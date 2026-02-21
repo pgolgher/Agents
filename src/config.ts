@@ -4,7 +4,7 @@ dotenv.config();
 
 export const config = {
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
-  model: "claude-opus-4-6" as const,
+  model: "claude-haiku-4-5" as const,
 };
 
 if (!config.anthropicApiKey) {
