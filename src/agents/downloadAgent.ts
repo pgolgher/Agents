@@ -57,9 +57,8 @@ export async function previewTarefas(): Promise<string> {
 
     // ── Step 2: Click "Rede AGU" ──────────────────────────────────────────────
     console.log("[DownloadAgent] Looking for 'Rede AGU'...");
-    const redeAgu = page
-      .getByRole("button", { name: /rede\s*agu/i })
-      .or(page.locator("a, button, div").filter({ hasText: /rede\s*agu/i }).first());
+    // Uses the confirmed CSS class `bt-rede` found via DOM inspection
+    const redeAgu = page.locator("button.bt-rede");
 
     await redeAgu.waitFor({ state: "visible", timeout: 20_000 });
     await redeAgu.click();
