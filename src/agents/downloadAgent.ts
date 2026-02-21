@@ -40,11 +40,12 @@ export async function previewTarefas(): Promise<string> {
 
   const page = await context.newPage();
 
-  // Log every redirect so we can see the full chain
-  page.on("response", (response) => {
+  // Log all responses so we can trace the auth flow
+  page.on("response", async (response) => {
     const status = response.status();
-    if (status >= 300 && status < 400) {
-      console.log(`  ↳ [${status}] ${response.url()}`);
+    const url = response.url();
+    if (url.includes("supersapiens") || url.includes("agu.gov")) {
+      console.log(`  [${status}] ${url}`);
     }
   });
 
@@ -74,27 +75,61 @@ export async function previewTarefas(): Promise<string> {
     // ── Step 3: Fill the Rede AGU login form ─────────────────────────────────
     console.log("[DownloadAgent] Filling Rede AGU login form...");
 
+    // Angular Material reactive forms require real keystrokes (keydown/keypress/keyup)
+    // to mark fields as dirty/valid. fill() only fires a synthetic input event which
+    // Angular ignores — the button stays disabled. pressSequentially() types character
+    // by character, exactly like a real user, so Angular's FormControl updates correctly.
+
     // E-mail field: name="username", type="email"
     const emailField = page.locator('input[name="username"]');
     await emailField.click();
-    await emailField.fill(email);
-    await page.keyboard.press("Tab"); // trigger Angular change detection / blur
+    await page.keyboard.press("Control+a"); // select any autofill
+    await emailField.pressSequentially(email, { delay: 50 });
+    await page.keyboard.press("Tab"); // blur → Angular marks field touched
 
     // Senha field: name="password"
     const passField = page.locator('input[name="password"]');
     await passField.click();
-    await passField.fill(senha);
-    await page.keyboard.press("Tab"); // trigger Angular form validation
+    await page.keyboard.press("Control+a");
+    await passField.pressSequentially(senha, { delay: 50 });
+    await page.keyboard.press("Tab"); // blur → Angular validates form, enables Entrar
     await screenshot(page, OUTPUT_DIR, "03-form-filled");
 
     // ── Step 4: Submit ────────────────────────────────────────────────────────
-    // button.bt-rede is now "Entrar" — Playwright's actionability check waits
-    // until Angular enables it (i.e. the form becomes valid) before clicking.
-    console.log("[DownloadAgent] Submitting Rede AGU form...");
-    await redeAguBtn.click();
-    console.log("[DownloadAgent] Submitted. Waiting for navigation...");
+    // Debug: log button state and form validity before clicking
+    const btnState = await page.evaluate(() => {
+      const btn = document.querySelector("button.bt-rede") as HTMLButtonElement;
+      const email = document.querySelector('input[name="username"]') as HTMLInputElement;
+      const pass  = document.querySelector('input[name="password"]') as HTMLInputElement;
+      return {
+        btnDisabled:   btn?.disabled,
+        btnHasDisabledClass: btn?.className.includes("mat-mdc-button-disabled"),
+        emailValue:    email?.value,
+        emailNgValid:  email?.className.includes("ng-valid"),
+        passLength:    pass?.value.length,
+        passNgValid:   pass?.className.includes("ng-valid"),
+      };
+    });
+    console.log("[DownloadAgent] Pre-submit state:", JSON.stringify(btnState));
 
-    await page.waitForLoadState("networkidle", { timeout: 60_000 });
+    if (btnState.btnDisabled) {
+      // Button still disabled — Angular form not valid. Try pressing Enter instead.
+      console.log("[DownloadAgent] Button disabled — pressing Enter to submit...");
+      await passField.press("Enter");
+    } else {
+      console.log("[DownloadAgent] Button enabled — clicking Entrar...");
+      await redeAguBtn.click();
+    }
+    console.log("[DownloadAgent] Submitted. Waiting for navigation away from login...");
+
+    // waitForLoadState resolves too early on this Angular SPA — the auth API calls
+    // (ldap_get_token, profile) happen after Angular's route transition.
+    // Instead wait until the URL actually leaves /auth/login.
+    await page.waitForURL((url) => !url.toString().includes("/auth/login"), {
+      timeout: 60_000,
+    });
+    // Then wait for the page content to fully settle
+    await page.waitForLoadState("networkidle", { timeout: 30_000 });
     console.log(`[DownloadAgent] Final URL: ${page.url()}`);
 
     // ── Step 5: Screenshot the final screen ───────────────────────────────────
