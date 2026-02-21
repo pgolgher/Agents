@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { config } from "../config.js";
-import { webAgent } from "./webAgent.js";
-import { pdfAgent } from "./pdfAgent.js";
+import { config } from "../config";
+import { webAgent } from "./webAgent";
+import { pdfAgent } from "./pdfAgent";
 
 const client = new Anthropic({ apiKey: config.anthropicApiKey });
 
@@ -50,8 +50,6 @@ export async function orchestrate(input: CaseInput): Promise<CaseResult> {
   const stream = client.messages.stream({
     model: config.model,
     max_tokens: 8192,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    thinking: { type: "adaptive" } as any,
     system: `Você é LuAI, um assistente jurídico especializado em Direito Previdenciário brasileiro,
 desenvolvido para auxiliar advogados do governo federal em casos do INSS.
 

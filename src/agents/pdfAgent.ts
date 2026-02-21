@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { config } from "../config.js";
-import { parsePdfFile, parsePdfBuffer } from "../tools/pdfParser.js";
+import { config } from "../config";
+import { parsePdfFile, parsePdfBuffer } from "../tools/pdfParser";
 
 const client = new Anthropic({ apiKey: config.anthropicApiKey });
 
@@ -24,8 +24,6 @@ export async function pdfAgent(
   const stream = client.messages.stream({
     model: config.model,
     max_tokens: 4096,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    thinking: { type: "adaptive" } as any,
     system: `Você é um assistente jurídico especializado em Direito Previdenciário brasileiro.
 Seu papel é analisar documentos em PDF para extrair informações relevantes
 para casos de previdência social no Brasil (INSS, aposentadoria, benefícios, etc.).

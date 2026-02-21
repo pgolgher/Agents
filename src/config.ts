@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 
-dotenv.config();
+dotenv.config({ override: true });
 
 export const config = {
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",

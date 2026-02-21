@@ -1,4 +1,4 @@
-import { orchestrate, CaseInput } from "./agents/orchestrator.js";
+import { orchestrate, CaseInput } from "./agents/orchestrator";
 
 /**
  * LuAI — Brazilian Social Security Legal Assistant
