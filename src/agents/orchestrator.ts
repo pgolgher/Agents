@@ -50,7 +50,8 @@ export async function orchestrate(input: CaseInput): Promise<CaseResult> {
   const stream = client.messages.stream({
     model: config.model,
     max_tokens: 8192,
-    thinking: { type: "adaptive" },
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    thinking: { type: "adaptive" } as any,
     system: `Você é LuAI, um assistente jurídico especializado em Direito Previdenciário brasileiro,
 desenvolvido para auxiliar advogados do governo federal em casos do INSS.
 
