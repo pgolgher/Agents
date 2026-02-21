@@ -55,37 +55,43 @@ export async function previewTarefas(): Promise<string> {
     console.log(`[DownloadAgent] Landed on: ${page.url()}`);
     await screenshot(page, OUTPUT_DIR, "01-landing");
 
-    // ── Step 2: Click "Rede AGU" ──────────────────────────────────────────────
+    // ── Step 2: Click "Rede AGU" (toggles form — no page navigation) ────────────
     console.log("[DownloadAgent] Looking for 'Rede AGU'...");
-    // Uses the confirmed CSS class `bt-rede` found via DOM inspection
-    const redeAgu = page.locator("button.bt-rede");
+    // button.bt-rede serves dual purpose:
+    //   1st click → switches form to "Autenticação Rede AGU" (button text becomes "Entrar")
+    //   2nd click → submits the Rede AGU form (Playwright waits until form is valid/enabled)
+    const redeAguBtn = page.locator("button.bt-rede");
+    await redeAguBtn.waitFor({ state: "visible", timeout: 20_000 });
+    await redeAguBtn.click();
+    console.log("[DownloadAgent] Clicked 'Rede AGU'. Waiting for Rede AGU form...");
 
-    await redeAgu.waitFor({ state: "visible", timeout: 20_000 });
-    await redeAgu.click();
-    console.log("[DownloadAgent] Clicked 'Rede AGU'.");
-    await page.waitForLoadState("networkidle", { timeout: 30_000 });
-    console.log(`[DownloadAgent] Landed on: ${page.url()}`);
+    // Angular toggles the form in-place — no page navigation occurs.
+    // Wait for the email field to appear rather than waitForLoadState.
+    await page.locator('input[name="username"]').waitFor({ state: "visible", timeout: 10_000 });
+    console.log("[DownloadAgent] Rede AGU form is visible.");
     await screenshot(page, OUTPUT_DIR, "02-after-rede-agu");
 
-    // ── Step 3: Fill login form ───────────────────────────────────────────────
-    console.log("[DownloadAgent] Filling login form...");
+    // ── Step 3: Fill the Rede AGU login form ─────────────────────────────────
+    console.log("[DownloadAgent] Filling Rede AGU login form...");
 
-    // Username — try several common field patterns
-    const userField = page
-      .locator("input[type='email'], input[name*='user'], input[name*='login'], input[name*='username'], input[type='text']")
-      .first();
-    await userField.waitFor({ state: "visible", timeout: 20_000 });
-    await userField.fill(email);
+    // E-mail field: name="username", type="email"
+    const emailField = page.locator('input[name="username"]');
+    await emailField.click();
+    await emailField.fill(email);
+    await page.keyboard.press("Tab"); // trigger Angular change detection / blur
 
-    // Password
-    await page.locator("input[type='password']").first().fill(senha);
+    // Senha field: name="password"
+    const passField = page.locator('input[name="password"]');
+    await passField.click();
+    await passField.fill(senha);
+    await page.keyboard.press("Tab"); // trigger Angular form validation
     await screenshot(page, OUTPUT_DIR, "03-form-filled");
 
     // ── Step 4: Submit ────────────────────────────────────────────────────────
-    const submitBtn = page
-      .getByRole("button", { name: /entrar|login|acessar|continuar|sign in/i })
-      .first();
-    await submitBtn.click();
+    // button.bt-rede is now "Entrar" — Playwright's actionability check waits
+    // until Angular enables it (i.e. the form becomes valid) before clicking.
+    console.log("[DownloadAgent] Submitting Rede AGU form...");
+    await redeAguBtn.click();
     console.log("[DownloadAgent] Submitted. Waiting for navigation...");
 
     await page.waitForLoadState("networkidle", { timeout: 60_000 });
