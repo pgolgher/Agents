@@ -1,7 +1,32 @@
+/**
+ * downloadAgent.ts
+ *
+ * Downloads all "DOSSIÊ PAP GET INSS" documents from every judicial task
+ * assigned to the logged-in user, saving each as a PDF file under:
+ *
+ *   downloads/{NUP}/PAPGET-{filename}.pdf
+ *
+ * Strategy (entirely API-based after login):
+ *  1. Open browser, log in, extract JWT from localStorage, close browser.
+ *  2. For each task in the judicial task list (REST API):
+ *     a. Create downloads/{nup}/ subdirectory.
+ *     b. Fetch the juntada (document) list for the processo via REST API.
+ *     c. Find all juntadas whose tipoDocumento.nome matches "DOSSIÊ PAP GET INSS".
+ *     d. For each component digital of those juntadas, download via:
+ *           GET /v1/administrativo/componente_digital/{id}/download
+ *        The response is JSON with a `conteudo` field containing a base64
+ *        data URI: "data:application/pdf;...;base64,<B64_PDF_CONTENT>"
+ *     e. Decode base64 → save as .pdf file.
+ *     f. Write _manifest.json.
+ *  3. Write top-level index.json.
+ *
+ * Run: npm run download
+ */
+
 import { chromium } from "playwright";
+import axios, { AxiosInstance } from "axios";
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
 import dotenv from "dotenv";
 
 dotenv.config({ override: true });
@@ -9,7 +34,6 @@ dotenv.config({ override: true });
 const AGU_URL =
   "https://supersapiens.agu.gov.br/apps/tarefas/judicial/minhas-tarefas/entrada";
 const BACKEND = "https://supersapiensbackend.agu.gov.br";
-
 const OUTPUT_DIR = path.resolve(process.cwd(), "downloads");
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -23,103 +47,71 @@ interface TarefaTask {
   setor: string;
 }
 
-interface TarefaRecord {
-  task: TarefaTask;
-  /** Text from the <processo-capa> Angular component (the right-panel capa view) */
-  capaText: string;
-  /** Text from the full <tarefa-detail> panel (broader context) */
-  taskDetailText: string;
-  /** Structured processo data from the backend REST API */
-  processoDetails: Record<string, any>;
-  /** Full tarefa entity from the backend REST API */
-  tarefaDetails: Record<string, any>;
-  screenshotPath: string;
-  extractedAt: string;
+interface DownloadedFile {
+  componenteId: number;
+  fileName: string;
+  filePath: string;
+  sizeBytes: number;
+  juntadaSeq: number;
 }
 
-/**
- * FINAL WORKING STRATEGY:
- *
- * 1. Login normally (networkidle, no special Chromium flags needed).
- *
- * 2. Fetch task list from the REST API using JWT extracted from localStorage.
- *
- * 3. For each task — click div.info inside the task card:
- *    - card.click() on cdk-tarefa-list-item triggers checkbox selection (wrong)
- *    - JS dispatchEvent alone doesn't trigger Angular navigation (wrong)
- *    - div.info.click() triggers Angular router navigation ← THIS WORKS
- *
- * 4. Content renders in <processo-capa> (Angular component at router-outlet[4]),
- *    NOT in div.center (which is just the initial empty-state spinner).
- *    Wait for processo-capa to have content > 50 chars.
- *
- * 5. Also extract from <tarefa-detail> for additional context.
- *
- * 6. Enrich with REST API data (processo details, tarefa details).
- */
-export async function downloadTarefas(): Promise<TarefaRecord[]> {
+interface TaskManifest {
+  taskId: number;
+  nup: string;
+  processoId: number;
+  especie: string;
+  prazo: string;
+  setor: string;
+  downloadedAt: string;
+  files: DownloadedFile[];
+  skipped: boolean;
+  skipReason?: string;
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────────
+
+export async function downloadTarefas(): Promise<TaskManifest[]> {
   const email = process.env.AGU_EMAIL;
   const senha = process.env.AGU_SENHA;
-
   if (!email || !senha) {
-    throw new Error("AGU_EMAIL and AGU_SENHA must be set in your .env file.");
+    throw new Error("AGU_EMAIL and AGU_SENHA must be set in .env");
   }
 
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
-  const browser = await chromium.launch({
-    headless: false,
-    slowMo: 150,
-  });
-
-  const context = await browser.newContext({
-    viewport: { width: 1440, height: 900 },
-  });
-
+  // ── Step 1: Login and extract JWT ─────────────────────────────────────────
+  console.log("\n[DownloadAgent] Opening browser for login…");
+  const browser = await chromium.launch({ headless: false, slowMo: 100 });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await context.newPage();
-  page.on("console", (msg) => {
-    if (msg.type() === "log") console.log("[browser]", msg.text());
-  });
 
-  // ── Step 1: Login ────────────────────────────────────────────────────────────
-  console.log("\n[DownloadAgent] Logging in to SuperSapiens…");
-  await page.goto(AGU_URL, { waitUntil: "networkidle", timeout: 60_000 });
+  await page.goto(AGU_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  await page.waitForTimeout(3_000);
 
   await page.locator("button.bt-rede").waitFor({ state: "visible", timeout: 20_000 });
   await page.locator("button.bt-rede").click();
-  await page
-    .locator('input[name="username"][type="email"]')
-    .waitFor({ state: "visible", timeout: 10_000 });
+  await page.locator('input[name="username"][type="email"]').waitFor({ state: "visible", timeout: 10_000 });
 
-  const emailField = page.locator('input[name="username"][type="email"]');
-  await emailField.click();
+  await page.locator('input[name="username"][type="email"]').click();
   await page.keyboard.press("Control+a");
-  await emailField.pressSequentially(email, { delay: 50 });
+  await page.locator('input[name="username"][type="email"]').pressSequentially(email, { delay: 50 });
   await page.keyboard.press("Tab");
 
-  const passField = page.locator('input[name="password"]');
-  await passField.click();
+  await page.locator('input[name="password"]').first().click();
   await page.keyboard.press("Control+a");
-  await passField.pressSequentially(senha, { delay: 50 });
-  await page.keyboard.press("Tab");
+  await page.locator('input[name="password"]').first().pressSequentially(senha, { delay: 50 });
 
-  const btnDisabled = await page
-    .locator("button.bt-rede")
-    .evaluate((el: HTMLButtonElement) => el.disabled);
+  const btnDisabled = await page.locator("button.bt-rede").evaluate((el: HTMLButtonElement) => el.disabled);
   if (btnDisabled) {
-    await passField.press("Enter");
+    await page.locator('input[name="password"]').first().press("Enter");
   } else {
     await page.locator("button.bt-rede").click();
   }
 
-  await page.waitForURL(
-    (url) => !url.toString().includes("/auth/login"),
-    { timeout: 60_000 }
-  );
-  await page.waitForLoadState("networkidle", { timeout: 30_000 });
+  await page.waitForURL((url) => !url.toString().includes("/auth/login"), { timeout: 60_000 });
+  await page.waitForTimeout(5_000);
   console.log(`[DownloadAgent] ✅ Logged in → ${page.url()}`);
 
-  // ── Step 2: JWT + API auth ────────────────────────────────────────────────
   const jwtToken = await page.evaluate(() => {
     for (const key of Object.keys(localStorage)) {
       const val = localStorage.getItem(key);
@@ -131,43 +123,53 @@ export async function downloadTarefas(): Promise<TarefaRecord[]> {
     }
     return null;
   });
-  if (!jwtToken) throw new Error("JWT not found after login");
-  const authHeaders = { Authorization: `Bearer ${jwtToken}` };
 
-  const profileResp = await context.request.get(`${BACKEND}/profile`, { headers: authHeaders });
-  const profile = await profileResp.json();
-  const userId: number = profile.id;
-  console.log(`[DownloadAgent] User ${userId} — ${profile.nome ?? profile.username}`);
+  await browser.close();
 
-  // ── Step 3: Fetch task list ───────────────────────────────────────────────
-  console.log("[DownloadAgent] Fetching task list from API…");
-  const taskResp = await context.request.get(
-    `${BACKEND}/v1/administrativo/tarefa`,
-    {
-      headers: authHeaders,
-      params: {
-        where: JSON.stringify({
-          "usuarioResponsavel.id": `eq:${userId}`,
-          dataHoraConclusaoPrazo: "isNull",
-          "especieTarefa.generoTarefa.nome": "eq:JUDICIAL",
-          "folder.id": "isNull",
-        }),
-        limit: "200",
-        offset: "0",
-        order: JSON.stringify({ dataHoraFinalPrazo: "ASC" }),
-        populate: JSON.stringify([
-          "processo",
-          "especieTarefa",
-          "especieTarefa.generoTarefa",
-          "setorResponsavel",
-          "setorResponsavel.unidade",
-        ]),
-        context: JSON.stringify({ modulo: "judicial" }),
-      },
-    }
-  );
-  const taskData = await taskResp.json();
-  const tasks: TarefaTask[] = (taskData.entities ?? [])
+  if (!jwtToken) throw new Error("JWT not found in localStorage after login");
+  console.log(`[DownloadAgent] JWT extracted (${jwtToken.length} chars). Browser closed.`);
+
+  // ── Step 2: Build axios client with JWT ───────────────────────────────────
+  const api: AxiosInstance = axios.create({
+    baseURL: BACKEND,
+    headers: {
+      Authorization: `Bearer ${jwtToken}`,
+      "Content-Type": "application/json",
+    },
+    timeout: 120_000,
+  });
+
+  // ── Step 3: Get current user ──────────────────────────────────────────────
+  const profileResp = await api.get("/profile");
+  const userId: number = profileResp.data.id;
+  const userName: string = profileResp.data.nome ?? profileResp.data.username ?? "?";
+  console.log(`[DownloadAgent] User: ${userId} — ${userName}`);
+
+  // ── Step 4: Fetch task list ───────────────────────────────────────────────
+  console.log("[DownloadAgent] Fetching judicial task list…");
+  const taskResp = await api.get("/v1/administrativo/tarefa", {
+    params: {
+      where: JSON.stringify({
+        "usuarioResponsavel.id": `eq:${userId}`,
+        dataHoraConclusaoPrazo: "isNull",
+        "especieTarefa.generoTarefa.nome": "eq:JUDICIAL",
+        "folder.id": "isNull",
+      }),
+      limit: "200",
+      offset: "0",
+      order: JSON.stringify({ dataHoraFinalPrazo: "ASC" }),
+      populate: JSON.stringify([
+        "processo",
+        "especieTarefa",
+        "especieTarefa.generoTarefa",
+        "setorResponsavel",
+        "setorResponsavel.unidade",
+      ]),
+      context: JSON.stringify({ modulo: "judicial" }),
+    },
+  });
+
+  const tasks: TarefaTask[] = (taskResp.data.entities ?? [])
     .filter((t: any) => t.processo?.id)
     .map((t: any) => ({
       id: t.id,
@@ -177,278 +179,171 @@ export async function downloadTarefas(): Promise<TarefaRecord[]> {
       prazo: t.dataHoraFinalPrazo ?? "",
       setor: t.setorResponsavel?.nome ?? "",
     }));
-  console.log(`[DownloadAgent] ${tasks.length} tasks (API total: ${taskData.total}).`);
 
-  // ── Step 4: Wait for task list UI to render ───────────────────────────────
-  console.log("[DownloadAgent] Waiting for task cards in UI…");
-  await page.locator("cdk-tarefa-list-item").first().waitFor({
-    state: "visible",
-    timeout: 30_000,
-  });
-  // Let Angular fully initialize its services/subscriptions
-  await page.waitForTimeout(5_000);
-  console.log(
-    `[DownloadAgent] ${await page.locator("cdk-tarefa-list-item").count()} cards visible.`
-  );
+  console.log(`[DownloadAgent] ${tasks.length} tasks (API total: ${taskResp.data.total}).`);
 
   // ── Step 5: Process each task ─────────────────────────────────────────────
-  const results: TarefaRecord[] = [];
+  const results: TaskManifest[] = [];
 
   for (let i = 0; i < tasks.length; i++) {
     const task = tasks[i];
-    const safeNup = task.nup.replace(/[^a-z0-9]/gi, "_");
-    console.log(
-      `\n[DownloadAgent] (${i + 1}/${tasks.length}) ${task.nup} — task ${task.id}`
-    );
+    console.log(`\n[DownloadAgent] (${i + 1}/${tasks.length}) NUP ${task.nup} — task ${task.id}`);
+
+    // Create NUP subdirectory
+    const taskDir = path.join(OUTPUT_DIR, task.nup);
+    fs.mkdirSync(taskDir, { recursive: true });
+
+    const manifest: TaskManifest = {
+      taskId: task.id,
+      nup: task.nup,
+      processoId: task.processoId,
+      especie: task.especie,
+      prazo: task.prazo,
+      setor: task.setor,
+      downloadedAt: new Date().toISOString(),
+      files: [],
+      skipped: false,
+    };
 
     try {
-      // Scroll back to top of task list before each search
-      await page.evaluate(() => {
-        const vp = document.querySelector("cdk-virtual-scroll-viewport") as HTMLElement | null;
-        if (vp) vp.scrollTop = 0;
-      });
-      await page.waitForTimeout(300);
-
-      // Find the card for this task (scroll if needed — CDK virtual scroll)
-      const found = await scrollToCard(page, task.id);
-      if (!found) {
-        console.warn(`  ⚠ Card for task ${task.id} not found; skipping`);
-        continue;
-      }
-
-      // Click div.info inside the target card.
-      // This is the correct click target for Angular router navigation:
-      //   - div.content click → triggers checkbox selection (wrong)
-      //   - div.info click   → triggers in-app navigation to task detail ✓
-      const card = page.locator("cdk-tarefa-list-item").filter({ hasText: `Id ${task.id}` });
-      const infoDiv = card.locator("div.info").first();
-      await infoDiv.scrollIntoViewIfNeeded();
-      await infoDiv.click();
-      console.log("  ↪ Clicked div.info");
-
-      // Wait for the URL to change to this task's detail route
-      await page
-        .waitForURL(
-          (url) => url.toString().includes(`/tarefa/${task.id}/`),
-          { timeout: 20_000 }
-        )
-        .catch(() => console.warn(`  ⚠ URL did not update to /tarefa/${task.id}/`));
-
-      // Wait for <processo-capa> to have real content.
-      // This Angular component renders the right-panel "capa" (cover page) of
-      // the processo. It's at router-outlet[4] inside tarefa-detail → processo
-      // → processo-view → processo-capa.
-      const capaReady = await page
-        .waitForFunction(
-          () => {
-            const capa = document.querySelector("processo-capa") as HTMLElement | null;
-            return capa != null && capa.innerText.trim().length > 50;
-          },
-          { timeout: 25_000 }
-        )
-        .then(() => true)
-        .catch(() => false);
-
-      if (!capaReady) {
-        console.warn("  ⚠ processo-capa did not render in 25 s");
-      }
-
-      // Extract content
-      const capaText = await page.evaluate(() => {
-        const capa = document.querySelector("processo-capa") as HTMLElement | null;
-        return capa?.innerText?.trim() ?? "";
+      // ── Fetch juntada list for this processo ────────────────────────────
+      const juntadaResp = await api.get("/v1/administrativo/juntada", {
+        params: {
+          where: JSON.stringify({ "volume.processo.id": `eq:${task.processoId}` }),
+          limit: "200",
+          offset: "0",
+          order: JSON.stringify({ numeracaoSequencial: "ASC" }),
+          populate: JSON.stringify([
+            "documento",
+            "documento.componentesDigitais",
+            "documento.tipoDocumento",
+          ]),
+        },
       });
 
-      const taskDetailText = await page.evaluate(() => {
-        const detail = document.querySelector("tarefa-detail") as HTMLElement | null;
-        return detail?.innerText?.trim() ?? "";
-      });
+      const juntadas: any[] = juntadaResp.data.entities ?? [];
+      console.log(`  Juntadas: ${juntadas.length}`);
 
-      console.log(
-        `  ✔ capa: ${capaText.length} chars | detail: ${taskDetailText.length} chars`
+      // ── Find DOSSIÊ PAP GET INSS juntadas ──────────────────────────────
+      const papgetJuntadas = juntadas.filter((j: any) =>
+        /PAP.GET.INSS/i.test(j.documento?.tipoDocumento?.nome ?? "")
       );
 
-      // Screenshot
-      const screenshotPath = await takeScreenshot(page, OUTPUT_DIR, `task-${safeNup}`);
+      if (papgetJuntadas.length === 0) {
+        console.log("  ⚠ No DOSSIÊ PAP GET INSS documents found.");
+        manifest.skipped = false; // Not an error — just no matching docs
+        manifest.skipReason = "No DOSSIÊ PAP GET INSS documents in this processo";
+      } else {
+        console.log(`  Found ${papgetJuntadas.length} PAP GET INSS juntada(s).`);
 
-      // API enrichment
-      let processoDetails: Record<string, any> = {};
-      try {
-        const r = await context.request.get(
-          `${BACKEND}/v1/administrativo/processo/${task.processoId}`,
-          {
-            headers: authHeaders,
-            params: {
-              populate: JSON.stringify([
-                "classeProcessual",
-                "especieProcedimento",
-                "orgaoCentral",
-                "setorAtual",
-                "setorAtual.unidade",
-                "valorCausa",
-                "localizador",
-                "origemDados",
-                "modalidadeMeio",
-              ]),
-            },
+        for (const juntada of papgetJuntadas) {
+          const jSeq: number = juntada.numeracaoSequencial ?? 0;
+          const comps: any[] = juntada.documento?.componentesDigitais ?? [];
+          console.log(`  Juntada #${jSeq} — ${comps.length} component(s)`);
+
+          for (const comp of comps) {
+            const compId: number = comp.id;
+            const rawFileName: string = comp.fileName ?? `component-${compId}`;
+            // Ensure the filename has a dot before the extension
+            // e.g. "PAPGET-123-1-de-3pdf" → "PAPGET-123-1-de-3.pdf"
+            const fileName = rawFileName.replace(/([^.])pdf$/i, "$1.pdf");
+
+            try {
+              console.log(`    Downloading component ${compId} → ${fileName}…`);
+              const dlResp = await api.get(
+                `/v1/administrativo/componente_digital/${compId}/download`
+              );
+
+              // The response has a `conteudo` field: "data:application/pdf;...;base64,<B64>"
+              const conteudo: string = dlResp.data?.conteudo ?? "";
+              if (!conteudo) {
+                console.error(`    ❌ No 'conteudo' field in response for component ${compId}`);
+                continue;
+              }
+
+              // Strip the data URI prefix (everything up to and including the comma)
+              const commaIdx = conteudo.indexOf(",");
+              if (commaIdx === -1) {
+                console.error(`    ❌ Unexpected conteudo format for component ${compId}`);
+                continue;
+              }
+              const b64 = conteudo.slice(commaIdx + 1);
+              const buffer = Buffer.from(b64, "base64");
+
+              // Verify PDF magic bytes
+              const magic = buffer.subarray(0, 4).toString("ascii");
+              if (!magic.startsWith("%PDF")) {
+                console.warn(`    ⚠ Unexpected magic bytes: "${magic}" (expected "%PDF")`);
+              }
+
+              const filePath = path.join(taskDir, fileName);
+              fs.writeFileSync(filePath, buffer);
+              console.log(`    ✅ Saved ${fileName} (${(buffer.length / 1024 / 1024).toFixed(1)} MB)`);
+
+              manifest.files.push({
+                componenteId: compId,
+                fileName,
+                filePath,
+                sizeBytes: buffer.length,
+                juntadaSeq: jSeq,
+              });
+            } catch (dlErr: any) {
+              console.error(`    ❌ Download failed for component ${compId}: ${dlErr.message}`);
+            }
           }
-        );
-        processoDetails = await r.json();
-      } catch (e: any) {
-        console.warn(`  ⚠ Processo API: ${e.message}`);
+        }
       }
-
-      let tarefaDetails: Record<string, any> = {};
-      try {
-        const r = await context.request.get(
-          `${BACKEND}/v1/administrativo/tarefa/${task.id}`,
-          {
-            headers: authHeaders,
-            params: {
-              populate: JSON.stringify([
-                "processo",
-                "especieTarefa",
-                "especieTarefa.generoTarefa",
-                "setorResponsavel",
-                "usuarioResponsavel",
-                "observacao",
-                "documentoRemessa",
-              ]),
-              context: JSON.stringify({ modulo: "judicial" }),
-            },
-          }
-        );
-        tarefaDetails = await r.json();
-      } catch (e: any) {
-        console.warn(`  ⚠ Tarefa API: ${e.message}`);
-      }
-
-      const record: TarefaRecord = {
-        task,
-        capaText,
-        taskDetailText,
-        processoDetails,
-        tarefaDetails,
-        screenshotPath,
-        extractedAt: new Date().toISOString(),
-      };
-
-      const jsonPath = path.join(OUTPUT_DIR, `task-${safeNup}.json`);
-      fs.writeFileSync(jsonPath, JSON.stringify(record, null, 2), "utf-8");
-      console.log(`  ✅ Saved → ${jsonPath}`);
-      results.push(record);
     } catch (err: any) {
       console.error(`  ❌ Task ${task.id} failed: ${err.message}`);
+      manifest.skipped = true;
+      manifest.skipReason = err.message;
     }
-  }
 
-  console.log(
-    `\n[DownloadAgent] 🎉 Done! ${results.length}/${tasks.length} tasks processed.`
-  );
+    // Write per-task manifest
+    const manifestPath = path.join(taskDir, "_manifest.json");
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
+
+    results.push(manifest);
+  }
 
   // ── Step 6: Write summary index ───────────────────────────────────────────
   const indexPath = path.join(OUTPUT_DIR, "index.json");
-  fs.writeFileSync(
-    indexPath,
-    JSON.stringify(
-      results.map((r) => ({
-        nup: r.task.nup,
-        taskId: r.task.id,
-        processoId: r.task.processoId,
-        especie: r.task.especie,
-        prazo: r.task.prazo,
-        setor: r.task.setor,
-        classeProcessual:
-          r.processoDetails?.classeProcessual?.sigla ??
-          r.processoDetails?.classeProcessual?.nome ??
-          "",
-        orgaoCentral:
-          r.processoDetails?.orgaoCentral?.sigla ??
-          r.processoDetails?.orgaoCentral?.nome ??
-          "",
-        capaTextLength: r.capaText.length,
-        screenshotPath: r.screenshotPath,
-        extractedAt: r.extractedAt,
-      })),
-      null,
-      2
-    ),
-    "utf-8"
-  );
-  console.log(`[DownloadAgent] Index saved → ${indexPath}`);
+  const index = results.map((r) => ({
+    nup: r.nup,
+    taskId: r.taskId,
+    processoId: r.processoId,
+    especie: r.especie,
+    prazo: r.prazo,
+    setor: r.setor,
+    fileCount: r.files.length,
+    files: r.files.map((f) => f.fileName),
+    skipped: r.skipped,
+    skipReason: r.skipReason,
+    downloadedAt: r.downloadedAt,
+  }));
+  fs.writeFileSync(indexPath, JSON.stringify(index, null, 2), "utf-8");
 
-  await page.waitForTimeout(2_000);
-  await context.close();
-  await browser.close();
+  const totalFiles = results.reduce((s, r) => s + r.files.length, 0);
+  const tasksWithDocs = results.filter((r) => r.files.length > 0).length;
+  const tasksWithoutDocs = results.filter((r) => r.files.length === 0 && !r.skipped).length;
+  const failedTasks = results.filter((r) => r.skipped).length;
+
+  console.log(`\n[DownloadAgent] 🎉 Done!`);
+  console.log(`  Tasks with PAP GET INSS docs: ${tasksWithDocs}/${tasks.length}`);
+  console.log(`  Tasks without PAP GET INSS docs: ${tasksWithoutDocs}`);
+  console.log(`  Failed tasks: ${failedTasks}`);
+  console.log(`  Total PDF files downloaded: ${totalFiles}`);
+  console.log(`  Index saved → ${indexPath}`);
 
   return results;
-}
-
-// ── Helpers ────────────────────────────────────────────────────────────────────
-
-/**
- * Scroll the task list (CDK virtual scroll) until the card for taskId appears.
- * We scroll the viewport first back to top, then down, looking for "Id {taskId}".
- */
-async function scrollToCard(
-  page: import("playwright").Page,
-  taskId: number
-): Promise<boolean> {
-  // Task list panel is at roughly x=310–637, scroll over its center
-  const listX = 470;
-  const listY = 400;
-
-  for (let attempt = 0; attempt < 40; attempt++) {
-    const found = await page.evaluate((id: number) => {
-      return Array.from(document.querySelectorAll("cdk-tarefa-list-item")).some(
-        (c) => c.textContent?.includes(`Id ${id}`)
-      );
-    }, taskId);
-    if (found) return true;
-    // Scroll task list down
-    await page.mouse.move(listX, listY);
-    await page.mouse.wheel(0, 250);
-    await page.waitForTimeout(150);
-  }
-  return page.evaluate((id: number) => {
-    return Array.from(document.querySelectorAll("cdk-tarefa-list-item")).some(
-      (c) => c.textContent?.includes(`Id ${id}`)
-    );
-  }, taskId);
-}
-
-async function takeScreenshot(
-  page: import("playwright").Page,
-  dir: string,
-  label: string
-): Promise<string> {
-  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const filePath = path.join(dir, `${label}-${ts}.png`);
-  await page.screenshot({ path: filePath, fullPage: false });
-  console.log(`  📸 ${filePath}`);
-  return filePath;
-}
-
-function openFile(filePath: string): void {
-  try {
-    const cmd =
-      process.platform === "darwin"
-        ? `open "${filePath}"`
-        : process.platform === "win32"
-        ? `start "" "${filePath}"`
-        : `xdg-open "${filePath}"`;
-    execSync(cmd);
-  } catch {
-    // Non-fatal
-  }
 }
 
 // ── Run directly ───────────────────────────────────────────────────────────────
 if (require.main === module) {
   downloadTarefas()
     .then((results) => {
-      console.log(`\n✅ Done. ${results.length} tasks saved to ${OUTPUT_DIR}`);
-      openFile(OUTPUT_DIR);
+      const totalFiles = results.reduce((s, r) => s + r.files.length, 0);
+      console.log(`\n✅ Complete. ${totalFiles} PDFs saved to ${OUTPUT_DIR}`);
     })
     .catch((err) => {
       console.error("❌ Fatal error:", err.message);
