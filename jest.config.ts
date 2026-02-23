@@ -15,7 +15,10 @@ const config: Config = {
   },
   clearMocks: true,
   coverageDirectory: "coverage",
-  collectCoverageFrom: ["src/agents/downloadAgent.ts"],
+  collectCoverageFrom: [
+    "src/agents/downloadAgent.ts",
+    "src/agents/analysisAgent.ts",
+  ],
 };
 
 export default config;

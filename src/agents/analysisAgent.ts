@@ -37,8 +37,13 @@ const ANALYSIS_MANIFEST = "_analysis.json";
  */
 const MAX_PAGES_PER_CHUNK = 60;
 
-/** Milliseconds to wait between vision API calls to respect rate limits */
-const INTER_CHUNK_DELAY_MS = 3000;
+/**
+ * Milliseconds to wait between vision API calls.
+ * The org rate limit is 30,000 input tokens/minute for claude-opus-4-5.
+ * Each 60-page vision chunk uses ~15,000-30,000 tokens, so we need to
+ * wait ≥60 s between calls to avoid 429 errors.
+ */
+const INTER_CHUNK_DELAY_MS = 65_000;
 
 /** Maximum number of retries for rate-limited requests */
 const MAX_RETRIES = 4;
@@ -79,7 +84,7 @@ interface PageSpec {
 }
 
 /** Raw match returned by Claude's vision JSON response */
-interface VisionMatch {
+export interface VisionMatch {
   pages: number[];           // 1-based page numbers within the chunk
   documentType: string;      // matching entry from PROVA_DOCUMENTAL.md
   qualifyingContent: string; // specific content that qualifies as proof
@@ -226,10 +231,12 @@ async function splitPdfIntoChunks(
 
 /**
  * Builds the prompt sent to Claude for vision-based evidence detection.
- * pageOffset is the 0-based page index of the first page in this chunk
+ * chunkStartPage is the 0-based page index of the first page in this chunk
  * (used only for display purposes in the prompt, not for logic).
+ *
+ * Exported for unit testing.
  */
-function buildVisionPrompt(provaDocumental: string, chunkStartPage: number): string {
+export function buildVisionPrompt(provaDocumental: string, chunkStartPage: number): string {
   const pageNote =
     chunkStartPage > 0
       ? `\n(NOTA: Este é um fragmento do PDF. A página 1 deste fragmento corresponde à página ${chunkStartPage + 1} do documento original.)`
@@ -270,8 +277,10 @@ Se não houver nenhuma prova válida neste fragmento, retorne:
 /**
  * Parses Claude's vision JSON response and extracts VisionMatch objects.
  * Handles cases where Claude wraps JSON in markdown code blocks.
+ *
+ * Exported for unit testing.
  */
-function parseVisionResponse(responseText: string): VisionMatch[] {
+export function parseVisionResponse(responseText: string): VisionMatch[] {
   // Strip markdown code blocks if present
   let cleaned = responseText.trim();
   cleaned = cleaned.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "").trim();
