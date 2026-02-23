@@ -4,15 +4,13 @@
  * Analyses every downloaded DOSSIÊ PAP GET INSS dossier for each legal process.
  * For each process folder under downloads/:
  *
- *  1. Parses every PDF page by page using pdf-parse's pagerender callback.
- *  2. Builds two maps from the extracted text:
- *       a. Anexo ID → document name  (from the INSS portal index pages 1-2)
- *       b. Page index → Anexo ID     (from the "Anexo ID: XXXXX" footer on each page)
- *  3. Detects evidence in two ways:
- *       a. Text-based: pages with readable text matching rural-worker patterns
- *       b. Index-based: document names in the index that match evidence patterns
- *  4. Creates EVIDENCE.pdf with all evidence pages (using pdf-lib).
- *  5. Generates VERIDICT.md using Claude API with full legal analysis.
+ *  1. Parses every PDF page by page using pdf-parse's pagerender callback to build
+ *     the Anexo ID index (Anexo ID → document name, page → Anexo ID).
+ *  2. Uses Claude's vision API (PDF-as-document) to visually inspect every page
+ *     and identify which documents are valid proofs of rural activity per PROVA_DOCUMENTAL.md.
+ *     Large PDFs (> MAX_PAGES_PER_CHUNK pages) are split into sub-PDFs first.
+ *  3. Creates EVIDENCE.pdf with all pages belonging to identified evidence documents.
+ *  4. Generates VERIDICT.md using Claude API with full legal analysis.
  *
  * Run: npm run analyze
  */
@@ -32,94 +30,40 @@ const EVIDENCE_FILE = "EVIDENCE.pdf";
 const VERDICT_FILE = "VERIDICT.md";
 const ANALYSIS_MANIFEST = "_analysis.json";
 
-// ─── Evidence patterns ─────────────────────────────────────────────────────────
-
 /**
- * Patterns applied to readable page TEXT.
- * A page matches if ANY pattern is found (even after garbled encoding).
+ * Maximum pages to send to Claude in a single API call.
+ * Claude can handle ~100 pages but smaller chunks give better accuracy
+ * and avoid hitting token/size limits.
  */
-const TEXT_EVIDENCE_PATTERNS: Array<{ pattern: RegExp; type: string }> = [
-  { pattern: /\bLAVRADOR[AO]?\b/i, type: "Profissão LAVRADOR(A) encontrada no texto" },
-  { pattern: /TRABALHADOR[AO]?\s+RURAL/i, type: "TRABALHADOR(A) RURAL no texto" },
-  { pattern: /\bzona\s+rural\b|\b[aá]rea\s+rural\b/i, type: "Endereço em Zona/Área Rural" },
-  { pattern: /\batividade\s+rural\b/i, type: "Atividade Rural no texto" },
-  { pattern: /\bprodut[oa]r?\s+rural\b/i, type: "Produtor(a) Rural no texto" },
-  { pattern: /im[oó]vel\s+rural/i, type: "Imóvel Rural no texto" },
-  { pattern: /\bCCIR\b/, type: "CCIR - Certificado de Cadastro de Imóvel Rural" },
-  { pattern: /\bITR\b/, type: "ITR - Imposto Territorial Rural" },
-  { pattern: /\bPRONAF\b/i, type: "PRONAF - Agricultura Familiar" },
-  { pattern: /pescador\s+artesanal/i, type: "Pescador Artesanal" },
-  { pattern: /\bquilombola\b/i, type: "Quilombola" },
-  { pattern: /sindicato.*trabalhador.*rural|sindicato\s+rural/i, type: "Sindicato de Trabalhadores Rurais" },
-  { pattern: /\bCEAR\b/i, type: "CEAR - Certidão de Exercício de Atividade Rural" },
-  { pattern: /arrendamento.*rural|comodato.*rural|parceria\s+agr[ií]/i, type: "Contrato Rural" },
-  { pattern: /Agricultura\s+Familiar|\bCAF\b/i, type: "Agricultura Familiar / CAF" },
-  { pattern: /diarista\s+rural/i, type: "Diarista Rural" },
-  { pattern: /empregad[ao]\s+rural/i, type: "Empregado(a) Rural" },
-];
+const MAX_PAGES_PER_CHUNK = 60;
 
-/**
- * Patterns applied to DOCUMENT NAMES from the INSS index table.
- * Grouped by confidence:
- *   definitive=true  → the document alone is strong proof
- *   definitive=false → the document may contain proof; needs manual inspection
- */
-interface IndexPattern {
-  pattern: RegExp;
-  type: string;
-  definitive: boolean;
-}
+/** Milliseconds to wait between vision API calls to respect rate limits */
+const INTER_CHUNK_DELAY_MS = 3000;
 
-const INDEX_EVIDENCE_PATTERNS: IndexPattern[] = [
-  // ── Definitive evidence by document name alone ────────────────────────────
-  { pattern: /\bCCIR\b/, type: "CCIR - Certificado de Cadastro de Imóvel Rural", definitive: true },
-  { pattern: /\bITR\b/, type: "ITR - Declaração do Imposto Territorial Rural", definitive: true },
-  { pattern: /\bPRONAF\b/i, type: "PRONAF - Programa Nacional de Agricultura Familiar", definitive: true },
-  { pattern: /pescador\s+artesanal/i, type: "Carteira de Pescador Artesanal", definitive: true },
-  { pattern: /\bquilombola\b/i, type: "Carteira de Associação Quilombola", definitive: true },
-  { pattern: /sindicato.*rural|sindicato.*trabalhador/i, type: "Ficha de Inscrição em Sindicato de Trabalhadores Rurais", definitive: true },
-  { pattern: /\bCEAR\b/i, type: "CEAR - Certidão de Exercício de Atividade Rural (FUNAI)", definitive: true },
-  { pattern: /arrendamento.*rural|comodato.*rural|parceria\s+rural/i, type: "Contrato Rural (Arrendamento/Comodato/Parceria)", definitive: true },
-  { pattern: /legitimação.*terras|terras\s+devolutas/i, type: "Título de Legitimação de Terras Devolutas", definitive: true },
-  { pattern: /Agricultura\s+Familiar/i, type: "Cadastro Nacional de Agricultura Familiar", definitive: true },
-  { pattern: /\bCAF\b.*produção|produção.*\bCAF\b/i, type: "CAF - Unidade Familiar de Produção Agrária", definitive: true },
-  { pattern: /inscrição\s+estadual.*produtor|produtor.*inscrição\s+estadual/i, type: "Inscrição Estadual de Produtor Rural", definitive: true },
-  { pattern: /\bCAR\b.*rural|rural.*\bCAR\b/i, type: "CAR - Cadastro Ambiental Rural", definitive: true },
-  { pattern: /produt[oa]r?\s+rural/i, type: "Documento de Produtor Rural", definitive: true },
-  { pattern: /CTPS|carteira.*trabalho/i, type: "CTPS - Carteira de Trabalho (verificar vínculos rurais)", definitive: false },
+/** Maximum number of retries for rate-limited requests */
+const MAX_RETRIES = 4;
 
-  // ── Conditional evidence (needs manual inspection) ────────────────────────
-  { pattern: /certid[aã]o.*nascimento|assento.*nascimento/i, type: "Certidão de Nascimento (verificar profissão dos pais)", definitive: false },
-  { pattern: /certid[aã]o.*casamento/i, type: "Certidão de Casamento (verificar profissão)", definitive: false },
-  { pattern: /t[ií]tulo.*eleitoral|certid[aã]o.*eleitoral|ficha.*eleitoral/i, type: "Título/Certidão Eleitoral (verificar ocupação declarada)", definitive: false },
-  { pattern: /alistamento\s+militar|dispensa\s+militar|certificado\s+militar/i, type: "Certificado Militar (verificar profissão)", definitive: false },
-  { pattern: /cart[aã]o\s+gestante|caderneta\s+gestante/i, type: "Cartão/Caderneta da Gestante (verificar profissão)", definitive: false },
-  { pattern: /caderneta\s+vacina/i, type: "Caderneta de Vacinação (verificar endereço rural)", definitive: false },
-  { pattern: /cart[aã]o\s+crian[çc]a/i, type: "Cartão da Criança (verificar endereço rural)", definitive: false },
-  { pattern: /prontu[aá]rio/i, type: "Prontuário Médico (verificar profissão/endereço)", definitive: false },
-  { pattern: /interna[çc][aã]o|ficha.*intern/i, type: "Ficha de Internação (verificar profissão/endereço)", definitive: false },
-  { pattern: /matr[ií]cula\s+escolar|ficha.*escolar/i, type: "Ficha de Matrícula Escolar (verificar profissão dos pais)", definitive: false },
-  { pattern: /\bINAMPS\b/i, type: "Carteira de Saúde INAMPS (verificar profissão)", definitive: false },
-  { pattern: /cadastro.*SUS|SUS.*cadastro|ficha.*SUS/i, type: "Cadastro SUS (verificar profissão)", definitive: false },
-  { pattern: /CEMIG|conta.*energia|conta.*luz/i, type: "Conta de Energia CEMIG (verificar endereço rural)", definitive: false },
-  { pattern: /funer[aá]rio|funér[aá]ria/i, type: "Plano Funerário (verificar profissão)", definitive: false },
-  { pattern: /peti[çc][aã]o\s+admin/i, type: "Petição Administrativa (verificar narrativa de trabalho rural)", definitive: false },
-];
+/** Promisified sleep */
+const sleep = (ms: number): Promise<void> => new Promise((res) => setTimeout(res, ms));
 
 // ─── Interfaces ────────────────────────────────────────────────────────────────
 
 export interface EvidenceMatch {
   sourceFile: string;
-  pageIndex: number;    // 0-based
-  pageNumber: number;   // 1-based
+  pageIndex: number;    // 0-based index in the source PDF
+  pageNumber: number;   // 1-based page number
   anexoId?: string;
   documentName?: string;
-  evidenceType: string;
-  definitive: boolean;
-  excerpt: string;      // first 400 chars of page text (may be empty for scanned pages)
+  evidenceType: string; // document type from PROVA_DOCUMENTAL.md
+  definitive: boolean;  // true = high confidence from vision
+  excerpt: string;      // what Claude found (qualifying content)
 }
 
+/** Current version tag — used to invalidate old keyword-based manifests */
+const ANALYSIS_VERSION = "vision-v1";
+
 interface AnalysisManifest {
+  version: string;
   nup: string;
   analyzedAt: string;
   pdfFiles: string[];
@@ -129,12 +73,26 @@ interface AnalysisManifest {
   verdictWritten: boolean;
 }
 
-// ─── Per-page text extraction ──────────────────────────────────────────────────
+interface PageSpec {
+  pdfPath: string;
+  pageIndex: number;
+}
+
+/** Raw match returned by Claude's vision JSON response */
+interface VisionMatch {
+  pages: number[];           // 1-based page numbers within the chunk
+  documentType: string;      // matching entry from PROVA_DOCUMENTAL.md
+  qualifyingContent: string; // specific content that qualifies as proof
+  confidence: "high" | "medium";
+}
+
+// ─── Per-page text extraction (kept for Anexo ID index only) ─────────────────
 
 /**
  * Extracts text from every page of a PDF.
  * Returns an array of strings indexed by page (0-based).
- * Scanned/image pages will return mostly whitespace.
+ * Scanned/image pages will return mostly whitespace — that is expected.
+ * This is used ONLY to build the Anexo ID index, not for evidence detection.
  */
 export async function extractPageTexts(pdfPath: string): Promise<string[]> {
   const buffer = fs.readFileSync(pdfPath);
@@ -208,13 +166,12 @@ export function parseAnexoMaps(
     const window = fullText.slice(pos + id.length, pos + id.length + 250);
 
     // Strip optional leading sequence number (digits + dots + spaces)
-    // e.g. "1.1 TERMO…" or "2 DOCUMENTO…" or "OAB…" (no prefix)
     const stripped = window.replace(/^[\d.\s]+/, "");
 
-    // Join any newline inside the filename (filename can wrap to next line)
+    // Join any newline inside the filename
     const oneline = stripped.replace(/\n/g, " ").replace(/\s+/g, " ");
 
-    // Extract up to the first ".pdf" (case-insensitive), lazy so we stop early
+    // Extract up to the first ".pdf"
     const pdfMatch = oneline.match(/^(.+?\.pdf)/i);
     if (pdfMatch) {
       docByAnexo.set(id, pdfMatch[1].trim());
@@ -224,72 +181,249 @@ export function parseAnexoMaps(
   return { anexoByPage, docByAnexo };
 }
 
-// ─── Evidence detection ────────────────────────────────────────────────────────
+// ─── PDF chunk splitting ───────────────────────────────────────────────────────
+
+interface PdfChunk {
+  buffer: Buffer;
+  startPageIndex: number; // 0-based index of first page in original PDF
+  pageCount: number;
+}
 
 /**
- * Detects evidence on each page using both text patterns and index document names.
- * Returns one EvidenceMatch per (page, pattern) hit — deduplicated to one per page.
+ * Splits a PDF buffer into chunks of at most maxPagesPerChunk pages.
+ * Each chunk is a self-contained PDF buffer.
+ * Returns an array of chunks with the 0-based start page index.
  */
-export function detectEvidence(
-  pageTexts: string[],
-  sourceFile: string,
-  anexoByPage: Map<number, string>,
-  docByAnexo: Map<string, string>
-): EvidenceMatch[] {
-  const matches: EvidenceMatch[] = [];
-  const seenPages = new Set<number>(); // deduplicate: one match per page
+async function splitPdfIntoChunks(
+  pdfBuffer: Buffer,
+  maxPagesPerChunk: number
+): Promise<PdfChunk[]> {
+  const srcDoc = await PDFDocument.load(pdfBuffer);
+  const totalPages = srcDoc.getPageCount();
 
-  // ── 1. Text-based detection ──────────────────────────────────────────────
-  for (let i = 0; i < pageTexts.length; i++) {
-    const text = pageTexts[i];
-    const readable = text.replace(/[^\x20-\x7E\xA0-\xFF]/g, " ").trim();
+  if (totalPages <= maxPagesPerChunk) {
+    return [{ buffer: pdfBuffer, startPageIndex: 0, pageCount: totalPages }];
+  }
 
-    for (const { pattern, type } of TEXT_EVIDENCE_PATTERNS) {
-      if (pattern.test(readable)) {
-        const anexoId = anexoByPage.get(i);
-        matches.push({
-          sourceFile,
-          pageIndex: i,
-          pageNumber: i + 1,
-          anexoId,
-          documentName: anexoId ? docByAnexo.get(anexoId) : undefined,
-          evidenceType: type,
-          definitive: true,
-          excerpt: readable.slice(0, 400).replace(/\n/g, " "),
-        });
-        seenPages.add(i);
-        break; // one text match per page
-      }
+  const chunks: PdfChunk[] = [];
+  for (let start = 0; start < totalPages; start += maxPagesPerChunk) {
+    const end = Math.min(start + maxPagesPerChunk, totalPages);
+    const chunkDoc = await PDFDocument.create();
+    const indices = Array.from({ length: end - start }, (_, i) => start + i);
+    const copiedPages = await chunkDoc.copyPages(srcDoc, indices);
+    copiedPages.forEach((p) => chunkDoc.addPage(p));
+    const bytes = await chunkDoc.save();
+    chunks.push({
+      buffer: Buffer.from(bytes),
+      startPageIndex: start,
+      pageCount: end - start,
+    });
+  }
+  return chunks;
+}
+
+// ─── Vision-based evidence detection ─────────────────────────────────────────
+
+/**
+ * Builds the prompt sent to Claude for vision-based evidence detection.
+ * pageOffset is the 0-based page index of the first page in this chunk
+ * (used only for display purposes in the prompt, not for logic).
+ */
+function buildVisionPrompt(provaDocumental: string, chunkStartPage: number): string {
+  const pageNote =
+    chunkStartPage > 0
+      ? `\n(NOTA: Este é um fragmento do PDF. A página 1 deste fragmento corresponde à página ${chunkStartPage + 1} do documento original.)`
+      : "";
+
+  return `Você é um perito em Direito Previdenciário brasileiro especializado em aposentadoria rural.${pageNote}
+
+Analise CUIDADOSAMENTE cada página deste PDF. Seu objetivo é identificar quais documentos constituem PROVA DE ATIVIDADE RURAL válida conforme a lista abaixo.
+
+DOCUMENTOS ACEITOS COMO PROVA DE ATIVIDADE RURAL:
+${provaDocumental}
+
+INSTRUÇÕES CRÍTICAS:
+- Examine visualmente cada página — não assuma o conteúdo pelo tipo de documento
+- Para certidões (nascimento, casamento): só é prova se o campo PROFISSÃO/OCUPAÇÃO contiver "LAVRADOR", "LAVRADORO(A)", "TRABALHADOR RURAL" ou "TRABALHADORA RURAL"
+- Para prontuários médicos, fichas de internação, cadernetas: verifique endereço (Zona Rural) OU ocupação (Lavrador/Trabalhador Rural)
+- Para CTPS (Carteira de Trabalho): identifique entradas de emprego com vínculo rural (categoria de trabalhador rural, empresas rurais, etc.)
+- Para ITR, CCIR, PRONAF, CAR, sindicato rural, CAF: esses documentos por si só já são prova
+- Para fichas eleitorais/título eleitoral: só é prova se o campo OCUPAÇÃO mostrar "TRABALHADOR RURAL" ou "LAVRADOR(A)"
+- Se um documento não estiver legível ou não corresponder a nenhum tipo da lista, NÃO inclua
+
+Retorne EXCLUSIVAMENTE um JSON válido com este formato (sem texto antes ou depois):
+{
+  "evidenceFound": [
+    {
+      "pages": [1, 2],
+      "documentType": "tipo exato copiado da lista acima",
+      "qualifyingContent": "descrição específica do que foi encontrado que qualifica como prova",
+      "confidence": "high"
+    }
+  ]
+}
+
+Se não houver nenhuma prova válida neste fragmento, retorne:
+{"evidenceFound": []}`;
+}
+
+/**
+ * Parses Claude's vision JSON response and extracts VisionMatch objects.
+ * Handles cases where Claude wraps JSON in markdown code blocks.
+ */
+function parseVisionResponse(responseText: string): VisionMatch[] {
+  // Strip markdown code blocks if present
+  let cleaned = responseText.trim();
+  cleaned = cleaned.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "").trim();
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    // Try to extract JSON object from surrounding text
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return [];
+    try {
+      parsed = JSON.parse(jsonMatch[0]);
+    } catch {
+      return [];
     }
   }
 
-  // ── 2. Index-based detection (catch pages whose Anexo ID doc name matches) ─
-  for (const [pageIndex, anexoId] of anexoByPage) {
-    if (seenPages.has(pageIndex)) continue; // already matched by text
+  if (!parsed?.evidenceFound || !Array.isArray(parsed.evidenceFound)) return [];
 
-    const docName = docByAnexo.get(anexoId);
-    if (!docName) continue;
+  return parsed.evidenceFound
+    .filter(
+      (m: any) =>
+        Array.isArray(m.pages) &&
+        m.pages.length > 0 &&
+        typeof m.documentType === "string" &&
+        m.documentType.length > 0
+    )
+    .map((m: any) => ({
+      pages: m.pages.map(Number).filter((n: number) => n >= 1),
+      documentType: String(m.documentType),
+      qualifyingContent: String(m.qualifyingContent ?? ""),
+      confidence: m.confidence === "medium" ? "medium" : "high",
+    }));
+}
 
-    for (const { pattern, type, definitive } of INDEX_EVIDENCE_PATTERNS) {
-      if (pattern.test(docName)) {
-        matches.push({
-          sourceFile,
+/**
+ * Detects evidence of rural activity in a PDF using Claude's vision API.
+ * The PDF is sent page-by-page if large, otherwise as a whole document.
+ *
+ * Returns EvidenceMatch objects (one per page that is part of an evidence document).
+ * Multiple pages belonging to the same evidence document are each included.
+ */
+export async function detectEvidenceWithVision(
+  pdfPath: string,
+  provaDocumental: string,
+  anexoByPage: Map<number, string>,
+  docByAnexo: Map<string, string>
+): Promise<EvidenceMatch[]> {
+  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const pdfBuffer = fs.readFileSync(pdfPath);
+  const chunks = await splitPdfIntoChunks(pdfBuffer, MAX_PAGES_PER_CHUNK);
+  const allMatches: EvidenceMatch[] = [];
+  const seenPageIndices = new Set<number>();
+
+  for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx++) {
+    const chunk = chunks[chunkIdx];
+
+    // Polite delay between chunks to stay within rate limits
+    if (chunkIdx > 0) await sleep(INTER_CHUNK_DELAY_MS);
+
+    const base64 = chunk.buffer.toString("base64");
+    const prompt = buildVisionPrompt(provaDocumental, chunk.startPageIndex);
+
+    let responseText: string | null = null;
+    let lastErr: string = "";
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        // Exponential backoff: 15s, 30s, 60s, 120s
+        const waitMs = 15_000 * Math.pow(2, attempt - 1);
+        console.warn(`    ⏳ Rate limited — retrying chunk starting at page ${chunk.startPageIndex + 1} in ${waitMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES + 1})…`);
+        await sleep(waitMs);
+      }
+
+      try {
+        const response = await anthropic.messages.create({
+          model: "claude-opus-4-5",
+          max_tokens: 2048,
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "document",
+                  source: {
+                    type: "base64",
+                    media_type: "application/pdf",
+                    data: base64,
+                  },
+                } as any,
+                {
+                  type: "text",
+                  text: prompt,
+                },
+              ],
+            },
+          ],
+        });
+
+        const block = response.content[0];
+        if (block.type !== "text") {
+          console.warn(`    ⚠ Unexpected response type from vision API: ${block.type}`);
+          break;
+        }
+        responseText = block.text;
+        break; // success
+      } catch (err: any) {
+        lastErr = err.message ?? String(err);
+        const isRateLimit =
+          lastErr.includes("429") || lastErr.toLowerCase().includes("rate_limit");
+        if (!isRateLimit || attempt === MAX_RETRIES) {
+          console.error(`    ❌ Vision API error for chunk starting at page ${chunk.startPageIndex + 1}: ${lastErr}`);
+          break;
+        }
+        // Will retry
+      }
+    }
+
+    if (responseText === null) continue;
+
+    const visionMatches = parseVisionResponse(responseText);
+
+    for (const vm of visionMatches) {
+      for (const chunkPageNum of vm.pages) {
+        // Convert chunk-relative 1-based page number to 0-based original page index
+        const pageIndex = chunk.startPageIndex + chunkPageNum - 1;
+
+        // Bounds check
+        if (pageIndex < 0) continue;
+
+        // Deduplicate: keep first match per page
+        if (seenPageIndices.has(pageIndex)) continue;
+        seenPageIndices.add(pageIndex);
+
+        const anexoId = anexoByPage.get(pageIndex);
+        allMatches.push({
+          sourceFile: pdfPath,
           pageIndex,
           pageNumber: pageIndex + 1,
           anexoId,
-          documentName: docName,
-          evidenceType: type,
-          definitive,
-          excerpt: `[Documento: ${docName}]`,
+          documentName: anexoId ? docByAnexo.get(anexoId) : undefined,
+          evidenceType: vm.documentType,
+          definitive: vm.confidence === "high",
+          excerpt: vm.qualifyingContent,
         });
-        seenPages.add(pageIndex);
-        break;
       }
     }
   }
 
   // Sort by page order
-  return matches.sort((a, b) => a.pageIndex - b.pageIndex);
+  return allMatches.sort((a, b) => a.pageIndex - b.pageIndex);
 }
 
 // ─── Group pages by Anexo ID for full-document extraction ─────────────────────
@@ -334,11 +468,6 @@ export function expandToFullDocuments(
 
 // ─── EVIDENCE.pdf creation ────────────────────────────────────────────────────
 
-interface PageSpec {
-  pdfPath: string;
-  pageIndex: number;
-}
-
 /**
  * Creates a new PDF containing only the specified pages from one or more source PDFs.
  * Source PDFs are loaded once per file to avoid redundant disk reads.
@@ -382,6 +511,7 @@ export async function createEvidencePdf(
 
 /**
  * Generates a VERIDICT.md file using Claude with full legal analysis.
+ * Uses the vision-based evidence matches (richer than text-based).
  */
 async function generateVerdict(
   nup: string,
@@ -398,68 +528,49 @@ async function generateVerdict(
     ? fs.readFileSync(PROVA_DOCUMENTAL_PATH, "utf-8")
     : "(não disponível)";
 
-  // Build evidence summary
+  // Build evidence summary from vision analysis
   const definitiveMatches = matches.filter((m) => m.definitive);
   const conditionalMatches = matches.filter((m) => !m.definitive);
+
+  // Deduplicate by evidenceType for a cleaner summary
+  const definitiveByType = new Map<string, EvidenceMatch[]>();
+  for (const m of definitiveMatches) {
+    if (!definitiveByType.has(m.evidenceType)) definitiveByType.set(m.evidenceType, []);
+    definitiveByType.get(m.evidenceType)!.push(m);
+  }
+  const conditionalByType = new Map<string, EvidenceMatch[]>();
+  for (const m of conditionalMatches) {
+    if (!conditionalByType.has(m.evidenceType)) conditionalByType.set(m.evidenceType, []);
+    conditionalByType.get(m.evidenceType)!.push(m);
+  }
 
   const evidenceSummary =
     matches.length > 0
       ? [
-          definitiveMatches.length > 0
-            ? `### Evidências definitivas (${definitiveMatches.length})\n` +
-              definitiveMatches
-                .map(
-                  (m, i) =>
-                    `${i + 1}. **${m.evidenceType}** — ${path.basename(m.sourceFile)}, pág. ${m.pageNumber}` +
-                    (m.documentName ? `\n   Documento: "${m.documentName}"` : "") +
-                    (m.excerpt && !m.excerpt.startsWith("[Documento:")
-                      ? `\n   Trecho: "${m.excerpt.slice(0, 200).replace(/"/g, "'")}"` : "")
-                )
+          definitiveByType.size > 0
+            ? `### Evidências de alta confiança (${definitiveMatches.length} páginas em ${definitiveByType.size} tipo(s))\n` +
+              [...definitiveByType.entries()]
+                .map(([type, pages], i) => {
+                  const pageNums = pages.map((p) => `${path.basename(p.sourceFile)}:${p.pageNumber}`).join(", ");
+                  const details = pages[0].excerpt ? `\n   Conteúdo qualificador: "${pages[0].excerpt.slice(0, 300)}"` : "";
+                  return `${i + 1}. **${type}**\n   Páginas: ${pageNums}${details}`;
+                })
                 .join("\n")
             : "",
-          conditionalMatches.length > 0
-            ? `### Evidências condicionais — necessitam inspeção manual (${conditionalMatches.length})\n` +
-              conditionalMatches
-                .map(
-                  (m, i) =>
-                    `${i + 1}. **${m.evidenceType}** — ${path.basename(m.sourceFile)}, pág. ${m.pageNumber}` +
-                    (m.documentName ? `\n   Documento: "${m.documentName}"` : "")
-                )
+          conditionalByType.size > 0
+            ? `### Evidências de confiança média (${conditionalMatches.length} páginas em ${conditionalByType.size} tipo(s))\n` +
+              [...conditionalByType.entries()]
+                .map(([type, pages], i) => {
+                  const pageNums = pages.map((p) => `${path.basename(p.sourceFile)}:${p.pageNumber}`).join(", ");
+                  const details = pages[0].excerpt ? `\n   Conteúdo qualificador: "${pages[0].excerpt.slice(0, 300)}"` : "";
+                  return `${i + 1}. **${type}**\n   Páginas: ${pageNums}${details}`;
+                })
                 .join("\n")
             : "",
         ]
           .filter(Boolean)
           .join("\n\n")
-      : "Nenhuma evidência documental de atividade rural identificada automaticamente.";
-
-  // Collect readable text from evidence pages for Claude context
-  const evidenceTextSegments: string[] = [];
-  let totalChars = 0;
-  const MAX_CHARS = 50_000;
-
-  for (const m of matches) {
-    if (totalChars >= MAX_CHARS) break;
-    if (m.excerpt.startsWith("[Documento:")) continue; // scanned — no text
-    const pages = pageTexts.get(m.sourceFile) ?? [];
-    // Include the match page + 1 context page before it
-    const pageRange = [m.pageIndex - 1, m.pageIndex, m.pageIndex + 1].filter(
-      (i) => i >= 0 && i < pages.length
-    );
-    for (const pi of pageRange) {
-      const text = pages[pi];
-      if (!text || text.length < 50) continue;
-      const segment = `\n--- ${path.basename(m.sourceFile)}, pág. ${pi + 1} ---\n${text.slice(0, 1500)}\n`;
-      if (totalChars + segment.length <= MAX_CHARS) {
-        evidenceTextSegments.push(segment);
-        totalChars += segment.length;
-      }
-    }
-  }
-
-  const evidenceText =
-    evidenceTextSegments.length > 0
-      ? evidenceTextSegments.join("")
-      : "(Documentos são imagens digitalizadas — texto não extraível automaticamente)";
+      : "Nenhuma evidência documental de atividade rural identificada pela análise visual.";
 
   // List all document names found in index (for full picture)
   const allDocNames: string[] = [];
@@ -496,11 +607,8 @@ ${docListText}
 ## DOCUMENTOS ACEITOS COMO PROVA DE ATIVIDADE RURAL (conforme normativas do INSS e STJ)
 ${provaDocumental}
 
-## ANÁLISE AUTOMATIZADA — EVIDÊNCIAS IDENTIFICADAS
+## ANÁLISE VISUAL — EVIDÊNCIAS IDENTIFICADAS (por inspeção visual das páginas com Claude Vision)
 ${evidenceSummary}
-
-## TEXTO EXTRAÍVEL DAS PÁGINAS COM EVIDÊNCIAS
-${evidenceText}
 
 ---
 
@@ -518,10 +626,10 @@ Com base nas evidências encontradas e nos documentos listados, elabore um **PAR
 (liste e avalie todos os documentos do dossier identificados no índice)
 
 ## 4. Evidências de Atividade Rural Encontradas
-### 4.1 Evidências Definitivas
-(documentos que provam atividade rural sem necessidade de análise adicional)
-### 4.2 Evidências Condicionais
-(documentos que precisam ser inspecionados visualmente para confirmar)
+### 4.1 Evidências de Alta Confiança (visualmente confirmadas)
+(documentos onde a inspeção visual confirmou prova de atividade rural)
+### 4.2 Evidências de Confiança Média
+(documentos que podem conter prova — verificar conteúdo específico)
 
 ## 5. Análise dos Requisitos Legais
 (analise cada requisito do benefício contra as provas encontradas)
@@ -532,7 +640,7 @@ Com base nas evidências encontradas e nos documentos listados, elabore um **PAR
 
 ## 8. Conclusão e Recomendação
 **PARECER:** FAVORÁVEL / DESFAVORÁVEL / NECESSITA COMPLEMENTAÇÃO
-(justificativa objetiva com base nos documentos analisados)`;
+(justificativa objetiva com base nos documentos analisados visualmente)`;
 
   const response = await anthropic.messages.create({
     model: "claude-opus-4-5",
@@ -554,10 +662,21 @@ async function analyzeProcess(folderPath: string): Promise<void> {
   const verdictPath = path.join(folderPath, VERDICT_FILE);
   const analysisManifestPath = path.join(folderPath, ANALYSIS_MANIFEST);
 
-  // Skip if already fully analysed
-  if (fs.existsSync(evidencePath) && fs.existsSync(verdictPath)) {
-    console.log(`  ⏭ Already analysed. Skipping.`);
-    return;
+  // Skip if already fully analysed with the current vision-based approach
+  if (fs.existsSync(analysisManifestPath)) {
+    try {
+      const existing = JSON.parse(fs.readFileSync(analysisManifestPath, "utf-8"));
+      if (
+        existing.version === ANALYSIS_VERSION &&
+        existing.verdictWritten &&
+        fs.existsSync(verdictPath)
+      ) {
+        console.log(`  ⏭ Already analysed (${ANALYSIS_VERSION}). Skipping.`);
+        return;
+      }
+    } catch {
+      // Corrupt manifest — re-analyse
+    }
   }
 
   if (!fs.existsSync(manifestPath)) {
@@ -579,8 +698,8 @@ async function analyzeProcess(folderPath: string): Promise<void> {
   // Find PDFs
   const pdfFiles = fs
     .readdirSync(folderPath)
-    .filter((f) => /\.pdf$/i.test(f))
-    .sort() // process in order: 1-de-3, 2-de-3, 3-de-3
+    .filter((f) => /\.pdf$/i.test(f) && f !== EVIDENCE_FILE)
+    .sort()
     .map((f) => path.join(folderPath, f));
 
   if (pdfFiles.length === 0) {
@@ -598,12 +717,12 @@ async function analyzeProcess(folderPath: string): Promise<void> {
     return;
   }
 
-  console.log(`  📄 ${pdfFiles.length} PDF(s) — parsing pages…`);
+  console.log(`  📄 ${pdfFiles.length} PDF(s) — building Anexo ID index…`);
 
-  // ── Extract per-page text from all PDFs ────────────────────────────────────
+  // ── Extract per-page text (for Anexo ID index only) ────────────────────────
   const allPageTexts = new Map<string, string[]>();
   let totalPages = 0;
-  const allMatches: EvidenceMatch[] = [];
+  const allAnexoMaps = new Map<string, { anexoByPage: Map<number, string>; docByAnexo: Map<string, string> }>();
 
   for (const pdfPath of pdfFiles) {
     console.log(`    → ${path.basename(pdfPath)}…`);
@@ -611,21 +730,45 @@ async function analyzeProcess(folderPath: string): Promise<void> {
     try {
       pageTexts = await extractPageTexts(pdfPath);
     } catch (err: any) {
-      console.error(`    ❌ Parse error: ${err.message}`);
-      continue;
+      console.error(`    ❌ Text extraction error: ${err.message}`);
+      pageTexts = [];
     }
 
     allPageTexts.set(pdfPath, pageTexts);
     totalPages += pageTexts.length;
 
-    const { anexoByPage, docByAnexo } = parseAnexoMaps(pageTexts);
-    const matches = detectEvidence(pageTexts, pdfPath, anexoByPage, docByAnexo);
+    const maps = parseAnexoMaps(pageTexts);
+    allAnexoMaps.set(pdfPath, maps);
 
     console.log(
-      `       ${pageTexts.length} pages, ${docByAnexo.size} documents indexed, ` +
-      `${matches.length} evidence page(s) found`
+      `       ${pageTexts.length} pages, ${maps.docByAnexo.size} documents indexed in Anexo table`
     );
+  }
 
+  // ── Vision-based evidence detection ───────────────────────────────────────
+  console.log(`  🔎 Running vision-based evidence detection…`);
+
+  const provaDocumental = fs.existsSync(PROVA_DOCUMENTAL_PATH)
+    ? fs.readFileSync(PROVA_DOCUMENTAL_PATH, "utf-8")
+    : "";
+
+  const allMatches: EvidenceMatch[] = [];
+
+  for (const pdfPath of pdfFiles) {
+    const { anexoByPage, docByAnexo } = allAnexoMaps.get(pdfPath)!;
+    const pageTexts = allPageTexts.get(pdfPath)!;
+    const pageCount = pageTexts.length;
+
+    console.log(`    → Vision: ${path.basename(pdfPath)} (${pageCount} pages)…`);
+    let matches: EvidenceMatch[];
+    try {
+      matches = await detectEvidenceWithVision(pdfPath, provaDocumental, anexoByPage, docByAnexo);
+    } catch (err: any) {
+      console.error(`    ❌ Vision error: ${err.message}`);
+      matches = [];
+    }
+
+    console.log(`       ${matches.length} evidence page(s) identified by vision`);
     allMatches.push(...matches);
   }
 
@@ -636,7 +779,7 @@ async function analyzeProcess(folderPath: string): Promise<void> {
     const pageTexts = allPageTexts.get(pdfPath);
     if (!pageTexts) continue;
 
-    const { anexoByPage } = parseAnexoMaps(pageTexts);
+    const { anexoByPage } = allAnexoMaps.get(pdfPath)!;
     const fileMatches = allMatches.filter((m) => m.sourceFile === pdfPath);
 
     const expanded = expandToFullDocuments(fileMatches, pageTexts, anexoByPage, pdfPath);
@@ -675,13 +818,13 @@ async function analyzeProcess(folderPath: string): Promise<void> {
     const evidenceList =
       allMatches.length > 0
         ? allMatches.map((m) => `- ${m.evidenceType} (pág. ${m.pageNumber})`).join("\n")
-        : "Nenhuma evidência encontrada automaticamente";
+        : "Nenhuma evidência encontrada pela análise visual";
     const fallback = [
       `# PARECER TÉCNICO — ${nup}`,
       "",
       `**Erro ao gerar parecer automático:** ${err.message}`,
       "",
-      "## Evidências Identificadas",
+      "## Evidências Identificadas (Análise Visual)",
       evidenceList,
     ].join("\n");
     fs.writeFileSync(verdictPath, fallback, "utf-8");
@@ -689,6 +832,7 @@ async function analyzeProcess(folderPath: string): Promise<void> {
 
   // ── Write analysis manifest ────────────────────────────────────────────────
   const analysisManifest: AnalysisManifest = {
+    version: ANALYSIS_VERSION,
     nup,
     analyzedAt: new Date().toISOString(),
     pdfFiles,
