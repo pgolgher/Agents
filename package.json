@@ -8,6 +8,8 @@
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "download": "ts-node src/agents/downloadAgent.ts",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
     "lint": "eslint src --ext .ts"
   },
   "dependencies": {
@@ -20,8 +22,11 @@
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/node": "^22.10.7",
     "@types/pdf-parse": "^1.1.4",
+    "jest": "^30.2.0",
+    "ts-jest": "^29.4.6",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.3"
   }

@@ -36,6 +36,68 @@ const AGU_URL =
 const BACKEND = "https://supersapiensbackend.agu.gov.br";
 const OUTPUT_DIR = path.resolve(process.cwd(), "downloads");
 
+// ── Pure utility functions (exported for testing) ──────────────────────────────
+
+/**
+ * Adds a dot before the file extension when the raw fileName from the API
+ * omits it (e.g. "PAPGET-123-1-de-3pdf" → "PAPGET-123-1-de-3.pdf").
+ */
+export function fixFileName(raw: string): string {
+  return raw.replace(/([^.])pdf$/i, "$1.pdf");
+}
+
+/**
+ * Extracts a PDF Buffer from a base64 data URI returned by the
+ * /componente_digital/{id}/download endpoint.
+ *
+ * Expected format: "data:application/pdf;name=...;charset=utf-8;base64,<B64>"
+ * Throws if the string is not a valid data URI or decodes to non-PDF bytes.
+ */
+export function extractPdfBuffer(conteudo: string): Buffer {
+  const commaIdx = conteudo.indexOf(",");
+  if (commaIdx === -1) {
+    throw new Error("conteudo is not a valid data URI (no comma found)");
+  }
+  const b64 = conteudo.slice(commaIdx + 1);
+  const buf = Buffer.from(b64, "base64");
+  return buf;
+}
+
+/**
+ * Returns true when a juntada entity from the SuperSapiens API represents
+ * a "DOSSIÊ PAP GET INSS" document.
+ */
+export function isPapGetInss(juntada: unknown): boolean {
+  if (!juntada || typeof juntada !== "object") return false;
+  const j = juntada as Record<string, any>;
+  const nome: string = j.documento?.tipoDocumento?.nome ?? "";
+  return /PAP.GET.INSS/i.test(nome);
+}
+
+/**
+ * Decides whether to skip downloading a task directory that was already
+ * fully processed in a previous run.
+ *
+ * Returns true only when:
+ *  - A valid _manifest.json exists in taskDir
+ *  - manifest.skipped is false
+ *  - All listed files exist on disk
+ */
+export function shouldSkipTask(taskDir: string): boolean {
+  const manifestPath = path.join(taskDir, "_manifest.json");
+  if (!fs.existsSync(manifestPath)) return false;
+  try {
+    const m = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as {
+      skipped: boolean;
+      files: Array<{ filePath: string }>;
+    };
+    if (m.skipped) return false;
+    return m.files.every((f) => fs.existsSync(f.filePath));
+  } catch {
+    return false; // corrupt manifest — re-process
+  }
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 interface TarefaTask {
@@ -136,7 +198,7 @@ export async function downloadTarefas(): Promise<TaskManifest[]> {
       Authorization: `Bearer ${jwtToken}`,
       "Content-Type": "application/json",
     },
-    timeout: 120_000,
+    timeout: 600_000, // 10 min — large PDFs are returned as 13 MB base64 JSON
   });
 
   // ── Step 3: Get current user ──────────────────────────────────────────────
@@ -193,6 +255,19 @@ export async function downloadTarefas(): Promise<TaskManifest[]> {
     const taskDir = path.join(OUTPUT_DIR, task.nup);
     fs.mkdirSync(taskDir, { recursive: true });
 
+    // Skip if already fully downloaded (manifest exists with no errors)
+    if (shouldSkipTask(taskDir)) {
+      const existing: TaskManifest = JSON.parse(
+        fs.readFileSync(path.join(taskDir, "_manifest.json"), "utf-8")
+      );
+      console.log(`  ⏭ Already downloaded (${existing.files.length} files). Skipping.`);
+      results.push(existing);
+      continue;
+    }
+    if (fs.existsSync(path.join(taskDir, "_manifest.json"))) {
+      console.log(`  ↩ Partial download detected — retrying.`);
+    }
+
     const manifest: TaskManifest = {
       taskId: task.id,
       nup: task.nup,
@@ -225,9 +300,7 @@ export async function downloadTarefas(): Promise<TaskManifest[]> {
       console.log(`  Juntadas: ${juntadas.length}`);
 
       // ── Find DOSSIÊ PAP GET INSS juntadas ──────────────────────────────
-      const papgetJuntadas = juntadas.filter((j: any) =>
-        /PAP.GET.INSS/i.test(j.documento?.tipoDocumento?.nome ?? "")
-      );
+      const papgetJuntadas = juntadas.filter(isPapGetInss);
 
       if (papgetJuntadas.length === 0) {
         console.log("  ⚠ No DOSSIÊ PAP GET INSS documents found.");
@@ -244,51 +317,70 @@ export async function downloadTarefas(): Promise<TaskManifest[]> {
           for (const comp of comps) {
             const compId: number = comp.id;
             const rawFileName: string = comp.fileName ?? `component-${compId}`;
-            // Ensure the filename has a dot before the extension
-            // e.g. "PAPGET-123-1-de-3pdf" → "PAPGET-123-1-de-3.pdf"
-            const fileName = rawFileName.replace(/([^.])pdf$/i, "$1.pdf");
+            const fileName = fixFileName(rawFileName);
 
-            try {
-              console.log(`    Downloading component ${compId} → ${fileName}…`);
-              const dlResp = await api.get(
-                `/v1/administrativo/componente_digital/${compId}/download`
-              );
-
-              // The response has a `conteudo` field: "data:application/pdf;...;base64,<B64>"
-              const conteudo: string = dlResp.data?.conteudo ?? "";
-              if (!conteudo) {
-                console.error(`    ❌ No 'conteudo' field in response for component ${compId}`);
-                continue;
-              }
-
-              // Strip the data URI prefix (everything up to and including the comma)
-              const commaIdx = conteudo.indexOf(",");
-              if (commaIdx === -1) {
-                console.error(`    ❌ Unexpected conteudo format for component ${compId}`);
-                continue;
-              }
-              const b64 = conteudo.slice(commaIdx + 1);
-              const buffer = Buffer.from(b64, "base64");
-
-              // Verify PDF magic bytes
-              const magic = buffer.subarray(0, 4).toString("ascii");
-              if (!magic.startsWith("%PDF")) {
-                console.warn(`    ⚠ Unexpected magic bytes: "${magic}" (expected "%PDF")`);
-              }
-
-              const filePath = path.join(taskDir, fileName);
-              fs.writeFileSync(filePath, buffer);
-              console.log(`    ✅ Saved ${fileName} (${(buffer.length / 1024 / 1024).toFixed(1)} MB)`);
-
+            // Skip if file already exists and looks valid
+            const filePath = path.join(taskDir, fileName);
+            if (fs.existsSync(filePath) && fs.statSync(filePath).size > 1000) {
+              const existingSize = fs.statSync(filePath).size;
+              console.log(`    ⏭ ${fileName} already exists (${(existingSize / 1024 / 1024).toFixed(1)} MB). Skipping.`);
               manifest.files.push({
                 componenteId: compId,
                 fileName,
                 filePath,
-                sizeBytes: buffer.length,
+                sizeBytes: existingSize,
                 juntadaSeq: jSeq,
               });
-            } catch (dlErr: any) {
-              console.error(`    ❌ Download failed for component ${compId}: ${dlErr.message}`);
+              continue;
+            }
+
+            // Download with retries (3 attempts)
+            let downloaded = false;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                console.log(`    Downloading component ${compId} → ${fileName}${attempt > 1 ? ` (attempt ${attempt})` : ""}…`);
+                const dlResp = await api.get(
+                  `/v1/administrativo/componente_digital/${compId}/download`
+                );
+
+                // The response has a `conteudo` field: "data:application/pdf;...;base64,<B64>"
+                const conteudo: string = dlResp.data?.conteudo ?? "";
+                if (!conteudo) {
+                  console.error(`    ❌ No 'conteudo' field in response for component ${compId}`);
+                  break; // Don't retry — structural issue
+                }
+
+                const buffer = extractPdfBuffer(conteudo);
+
+                // Verify PDF magic bytes
+                const magic = buffer.subarray(0, 4).toString("ascii");
+                if (!magic.startsWith("%PDF")) {
+                  console.warn(`    ⚠ Unexpected magic bytes: "${magic}" (expected "%PDF")`);
+                }
+
+                fs.writeFileSync(filePath, buffer);
+                console.log(`    ✅ Saved ${fileName} (${(buffer.length / 1024 / 1024).toFixed(1)} MB)`);
+
+                manifest.files.push({
+                  componenteId: compId,
+                  fileName,
+                  filePath,
+                  sizeBytes: buffer.length,
+                  juntadaSeq: jSeq,
+                });
+                downloaded = true;
+                break;
+              } catch (dlErr: any) {
+                console.error(`    ❌ Attempt ${attempt} failed for component ${compId}: ${dlErr.message}`);
+                if (attempt < 3) {
+                  const waitSec = attempt * 10;
+                  console.log(`    ⏳ Waiting ${waitSec}s before retry…`);
+                  await new Promise((r) => setTimeout(r, waitSec * 1000));
+                }
+              }
+            }
+            if (!downloaded) {
+              console.error(`    ❌ All attempts failed for component ${compId} — skipping.`);
             }
           }
         }
