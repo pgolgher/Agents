@@ -8,6 +8,7 @@
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
     "download": "ts-node src/agents/downloadAgent.ts",
+    "analyze": "ts-node src/agents/analysisAgent.ts",
     "test": "jest",
     "test:coverage": "jest --coverage",
     "lint": "eslint src --ext .ts"
@@ -17,6 +18,7 @@
     "axios": "^1.7.9",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",
+    "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
     "playwright": "^1.58.2",
     "zod": "^3.24.2"
