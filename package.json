@@ -9,6 +9,7 @@
     "dev": "ts-node src/index.ts",
     "download": "ts-node src/agents/downloadAgent.ts",
     "analyze": "ts-node src/agents/analysisAgent.ts",
+    "serve": "ts-node src/server/index.ts",
     "test": "jest",
     "test:coverage": "jest --coverage",
     "lint": "eslint src --ext .ts"
@@ -18,16 +19,19 @@
     "axios": "^1.7.9",
     "cheerio": "^1.0.0",
     "dotenv": "^16.4.7",
+    "express": "^4.18.3",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
     "playwright": "^1.58.2",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/express": "^4.17.21",
     "@types/jest": "^30.0.0",
     "@types/node": "^22.10.7",
     "@types/pdf-parse": "^1.1.4",
     "jest": "^30.2.0",
+    "marked": "^14.0.0",
     "ts-jest": "^29.4.6",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.3"

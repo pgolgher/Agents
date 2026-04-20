@@ -21,6 +21,7 @@ import pdfParse from "pdf-parse";
 import { PDFDocument } from "pdf-lib";
 import Anthropic from "@anthropic-ai/sdk";
 import dotenv from "dotenv";
+import { config } from "../config";
 
 dotenv.config({ override: true });
 
@@ -358,7 +359,7 @@ export async function detectEvidenceWithVision(
 
       try {
         const response = await anthropic.messages.create({
-          model: "claude-opus-4-5",
+          model: process.env.LUAI_MODEL ?? config.model,
           max_tokens: 2048,
           messages: [
             {
@@ -652,7 +653,7 @@ Com base nas evidências encontradas e nos documentos listados, elabore um **PAR
 (justificativa objetiva com base nos documentos analisados visualmente)`;
 
   const response = await anthropic.messages.create({
-    model: "claude-opus-4-5",
+    model: process.env.LUAI_MODEL ?? config.model,
     max_tokens: 8192,
     messages: [{ role: "user", content: prompt }],
   });

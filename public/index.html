@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LuAI — Assistente Jurídico</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+
+    <!-- ── Topbar ── -->
+    <header class="topbar">
+      <div class="topbar__brand">
+        <span class="topbar__logo">◈</span>
+        <span class="topbar__name">LuAI</span>
+        <span class="topbar__tagline">Assistente Jurídico Previdenciário</span>
+      </div>
+      <nav class="tab-nav" role="tablist">
+        <button class="tab-btn tab-btn--active" data-tab="dashboard" role="tab">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M1 1.75A.75.75 0 011.75 1h3.5a.75.75 0 01.75.75v3.5A.75.75 0 015.25 6h-3.5A.75.75 0 011 5.25v-3.5zm0 8A.75.75 0 011.75 9h3.5a.75.75 0 01.75.75v3.5a.75.75 0 01-.75.75h-3.5a.75.75 0 01-.75-.75v-3.5zm8-8A.75.75 0 019.75 1h3.5a.75.75 0 01.75.75v3.5a.75.75 0 01-.75.75h-3.5a.75.75 0 01-.75-.75v-3.5zm0 8A.75.75 0 019.75 9h3.5a.75.75 0 01.75.75v3.5a.75.75 0 01-.75.75h-3.5a.75.75 0 01-.75-.75v-3.5z"/></svg>
+          Dashboard
+        </button>
+        <button class="tab-btn" data-tab="files" role="tab">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/></svg>
+          Arquivos
+        </button>
+      </nav>
+    </header>
+
+    <!-- ── Dashboard Tab ── -->
+    <main id="tab-dashboard" class="tab-panel tab-panel--active" role="tabpanel">
+
+      <!-- Stats bar -->
+      <div class="stats-bar">
+        <div class="stat-item">
+          <span class="stat-value" id="stat-total">—</span>
+          <span class="stat-label">Processos</span>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat-item">
+          <span class="stat-value" id="stat-analysed">—</span>
+          <span class="stat-label">Analisados</span>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat-item">
+          <span class="stat-value" id="stat-evidence">—</span>
+          <span class="stat-label">Com evidência</span>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat-item">
+          <span class="stat-value" id="stat-verdict">—</span>
+          <span class="stat-label">Com parecer</span>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat-item stat-item--controls">
+          <label class="stat-label" for="model-select">Modelo IA</label>
+          <select id="model-select" class="model-select" onchange="setModel(this.value)">
+            <option value="">Carregando…</option>
+          </select>
+        </div>
+        <div class="stat-item stat-item--controls">
+          <button class="btn btn--ghost btn--sm" onclick="cleanupOldRuns()" title="Remove NUPs não presentes no index.json atual">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M11 1.75V3h2.25a.75.75 0 010 1.5H2.75a.75.75 0 010-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75zM4.496 6.675a.75.75 0 10-1.492.15l.66 6.6A1.75 1.75 0 005.41 15h5.178a1.75 1.75 0 001.746-1.577l.66-6.6a.75.75 0 00-1.492-.149l-.66 6.6a.25.25 0 01-.249.226H5.408a.25.25 0 01-.249-.226l-.663-6.6z"/></svg>
+            Limpar runs antigos
+          </button>
+        </div>
+      </div>
+
+      <!-- Agent cards -->
+      <div class="agents-grid">
+
+        <!-- Download Agent -->
+        <div class="agent-card" id="agent-download">
+          <div class="card-header">
+            <div class="card-header__left">
+              <div class="status-dot" id="dot-download" title="Idle"></div>
+              <div class="card-title-group">
+                <h2 class="card-title">Download Agent</h2>
+                <p class="card-desc">Baixa dossiers PAPGET do sistema AGU</p>
+              </div>
+            </div>
+            <div class="card-actions">
+              <span class="uptime" id="uptime-download"></span>
+              <button class="btn btn--start" id="btn-start-download" onclick="startAgent('download')">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 110 16A8 8 0 018 0zm0 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zm-1.25 3.4l5 3.6-5 3.6V4.9z"/></svg>
+                Iniciar
+              </button>
+              <button class="btn btn--stop" id="btn-stop-download" onclick="stopAgent('download')" disabled>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 110 16A8 8 0 018 0zm0 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM5.5 5.5h5v5h-5z"/></svg>
+                Parar
+              </button>
+              <button class="btn btn--ghost" onclick="clearLogs('download')" title="Limpar logs">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M11 1.75V3h2.25a.75.75 0 010 1.5H2.75a.75.75 0 010-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75zM4.496 6.675a.75.75 0 10-1.492.15l.66 6.6A1.75 1.75 0 005.41 15h5.178a1.75 1.75 0 001.746-1.577l.66-6.6a.75.75 0 00-1.492-.149l-.66 6.6a.25.25 0 01-.249.226H5.408a.25.25 0 01-.249-.226l-.663-6.6z"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="log-terminal" id="log-download" aria-label="Download agent logs">
+            <div class="log-empty">Aguardando início do agente…</div>
+          </div>
+        </div>
+
+        <!-- Analysis Agent -->
+        <div class="agent-card" id="agent-analysis">
+          <div class="card-header">
+            <div class="card-header__left">
+              <div class="status-dot" id="dot-analysis" title="Idle"></div>
+              <div class="card-title-group">
+                <h2 class="card-title">Analysis Agent</h2>
+                <p class="card-desc">Analisa evidências rurais com visão de IA</p>
+              </div>
+            </div>
+            <div class="card-actions">
+              <span class="uptime" id="uptime-analysis"></span>
+              <button class="btn btn--start" id="btn-start-analysis" onclick="startAgent('analysis')">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 110 16A8 8 0 018 0zm0 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zm-1.25 3.4l5 3.6-5 3.6V4.9z"/></svg>
+                Iniciar
+              </button>
+              <button class="btn btn--stop" id="btn-stop-analysis" onclick="stopAgent('analysis')" disabled>
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a8 8 0 110 16A8 8 0 018 0zm0 1.5a6.5 6.5 0 100 13 6.5 6.5 0 000-13zM5.5 5.5h5v5h-5z"/></svg>
+                Parar
+              </button>
+              <button class="btn btn--ghost" onclick="clearLogs('analysis')" title="Limpar logs">
+                <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"><path d="M11 1.75V3h2.25a.75.75 0 010 1.5H2.75a.75.75 0 010-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75zM4.496 6.675a.75.75 0 10-1.492.15l.66 6.6A1.75 1.75 0 005.41 15h5.178a1.75 1.75 0 001.746-1.577l.66-6.6a.75.75 0 00-1.492-.149l-.66 6.6a.25.25 0 01-.249.226H5.408a.25.25 0 01-.249-.226l-.663-6.6z"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="log-terminal" id="log-analysis" aria-label="Analysis agent logs">
+            <div class="log-empty">Aguardando início do agente…</div>
+          </div>
+        </div>
+
+      </div>
+    </main>
+
+    <!-- ── Files Tab ── -->
+    <main id="tab-files" class="tab-panel" role="tabpanel" aria-hidden="true">
+      <div class="files-layout">
+
+        <!-- NUP sidebar -->
+        <aside class="nup-sidebar">
+          <div class="nup-sidebar__header">
+            <span class="nup-sidebar__title">Processos</span>
+            <span class="nup-count badge badge--count" id="nup-count">0</span>
+            <button class="btn btn--ghost btn--sm" onclick="loadNupList()" title="Recarregar">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><path d="M8 2.5a5.487 5.487 0 00-4.131 1.869l1.204 1.204A.25.25 0 014.896 6H1.25A.25.25 0 011 5.75V2.104a.25.25 0 01.427-.177l1.38 1.38A7.001 7.001 0 0114.95 7.16a.75.75 0 11-1.49.178A5.501 5.501 0 008 2.5zM1.705 8.005a.75.75 0 01.834.656 5.501 5.501 0 009.592 2.97l-1.204-1.204a.25.25 0 01.177-.427h3.646a.25.25 0 01.25.25v3.646a.25.25 0 01-.427.177l-1.38-1.38A7.001 7.001 0 011.05 8.84a.75.75 0 01.656-.834z"/></svg>
+            </button>
+          </div>
+          <div class="nup-sidebar__search">
+            <input type="search" class="search-input" id="nup-search" placeholder="Filtrar processos…" oninput="filterNups(this.value)">
+          </div>
+          <div class="nup-list" id="nup-list">
+            <div class="empty-state">
+              <p>Clique em Arquivos para carregar os processos</p>
+            </div>
+          </div>
+        </aside>
+
+        <!-- File viewer panel -->
+        <section class="file-viewer">
+          <div id="file-viewer-empty" class="file-viewer__empty">
+            <div class="empty-icon">📁</div>
+            <p>Selecione um processo na lista</p>
+          </div>
+          <div id="file-viewer-content" class="file-viewer__inner" hidden>
+            <!-- File chips row -->
+            <div class="file-chips" id="file-chips"></div>
+            <!-- Content area -->
+            <div class="file-content-area" id="file-content-area">
+              <div class="file-viewer__empty">
+                <div class="empty-icon">📄</div>
+                <p>Selecione um arquivo acima</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+
+  </div><!-- #app -->
+
+  <script src="/marked.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
