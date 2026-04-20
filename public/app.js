@@ -197,12 +197,18 @@ function connectSSE(agent) {
     catch { return; }
 
     if (msg.type === 'status') {
+      const wasRunning = State.agents[agent].running;
       State.agents[agent] = {
         running: msg.running,
         pid: msg.pid,
         startedAt: msg.startedAt,
       };
       renderAgentCard(agent);
+      // Auto-refresh stats when agent finishes
+      if (wasRunning && !msg.running) {
+        preloadStats();
+        if (State.nupsLoaded) loadNupList();
+      }
       return;
     }
 
