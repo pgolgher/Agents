@@ -248,6 +248,22 @@ async function stopAgent(agent) {
   }
 }
 
+async function restartAgent(agent) {
+  // Clear the terminal immediately for a clean restart experience
+  const terminal = document.getElementById(`log-${agent}`);
+  if (terminal) terminal.innerHTML = '<div class="log-empty">Reiniciando…</div>';
+
+  const res = await fetch(`/api/agents/${agent}/restart`, { method: 'POST' });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    appendLogLine(agent, {
+      ts: Date.now(),
+      line: `❌ Reinicialização falhou: ${err.error}`,
+      type: 'system',
+    });
+  }
+}
+
 // ─── Stats bar ────────────────────────────────────────────────────────────────
 
 function updateStats(nups) {

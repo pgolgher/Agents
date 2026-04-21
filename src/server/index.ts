@@ -345,6 +345,30 @@ app.post("/api/agents/:agent/stop", (req, res) => {
   return res.json({ ok: true });
 });
 
+/** POST /api/agents/:agent/restart — stop (if running), clear log buffer, start fresh */
+app.post("/api/agents/:agent/restart", (req, res) => {
+  const agent = req.params.agent as AgentName;
+  if (agent !== "download" && agent !== "analysis") {
+    return res.status(400).json({ error: "Unknown agent" });
+  }
+
+  const doStart = () => {
+    logBuffers[agent] = [];
+    startAgentProcess(agent);
+  };
+
+  if (agentState[agent].running) {
+    addLogLine(agent, "🔄 Restart requested — stopping current process…", "system");
+    stopAgentProcess(agent);
+    // Wait for the process to exit before starting a new one
+    agentState[agent].process!.once("close", () => doStart());
+  } else {
+    doStart();
+  }
+
+  return res.json({ ok: true });
+});
+
 /** GET /api/agents/:agent/logs/stream — SSE */
 app.get("/api/agents/:agent/logs/stream", (req, res) => {
   const agent = req.params.agent as AgentName;
