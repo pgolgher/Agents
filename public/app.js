@@ -248,20 +248,22 @@ async function stopAgent(agent) {
   }
 }
 
-async function restartAgent(agent) {
-  // Clear the terminal immediately for a clean restart experience
+async function eraseAndRestart(agent) {
   const terminal = document.getElementById(`log-${agent}`);
-  if (terminal) terminal.innerHTML = '<div class="log-empty">Reiniciando…</div>';
+  if (terminal) terminal.innerHTML = '<div class="log-empty">Apagando arquivos e reiniciando…</div>';
 
-  const res = await fetch(`/api/agents/${agent}/restart`, { method: 'POST' });
+  const res = await fetch(`/api/agents/${agent}/erase-restart`, { method: 'POST' });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
     appendLogLine(agent, {
       ts: Date.now(),
-      line: `❌ Reinicialização falhou: ${err.error}`,
+      line: `❌ Apagar+Reiniciar falhou: ${err.error}`,
       type: 'system',
     });
   }
+  // Refresh stats after erasing
+  preloadStats();
+  if (State.nupsLoaded) loadNupList();
 }
 
 // ─── Stats bar ────────────────────────────────────────────────────────────────

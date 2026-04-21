@@ -360,10 +360,65 @@ app.post("/api/agents/:agent/restart", (req, res) => {
   if (agentState[agent].running) {
     addLogLine(agent, "🔄 Restart requested — stopping current process…", "system");
     stopAgentProcess(agent);
-    // Wait for the process to exit before starting a new one
     agentState[agent].process!.once("close", () => doStart());
   } else {
     doStart();
+  }
+
+  return res.json({ ok: true });
+});
+
+/** POST /api/agents/:agent/erase-restart — erase all relevant files, then restart */
+app.post("/api/agents/:agent/erase-restart", (req, res) => {
+  const agent = req.params.agent as AgentName;
+  if (agent !== "download" && agent !== "analysis") {
+    return res.status(400).json({ error: "Unknown agent" });
+  }
+
+  const eraseFiles = (): { erased: number } => {
+    if (agent === "download") {
+      // Delete entire downloads/ directory contents (NUP folders + index.json)
+      let erased = 0;
+      if (fs.existsSync(DOWNLOADS_DIR)) {
+        for (const entry of fs.readdirSync(DOWNLOADS_DIR)) {
+          const p = path.join(DOWNLOADS_DIR, entry);
+          if (!p.startsWith(DOWNLOADS_DIR + path.sep)) continue;
+          fs.rmSync(p, { recursive: true, force: true });
+          erased++;
+        }
+      }
+      return { erased };
+    } else {
+      // Delete analysis outputs from every NUP folder
+      const ANALYSIS_FILES = ["EVIDENCE.pdf", "VERIDICT.md", "_analysis.json"];
+      let erased = 0;
+      if (fs.existsSync(DOWNLOADS_DIR)) {
+        for (const nup of fs.readdirSync(DOWNLOADS_DIR)) {
+          const nupDir = path.join(DOWNLOADS_DIR, nup);
+          try { if (!fs.statSync(nupDir).isDirectory()) continue; } catch { continue; }
+          for (const f of ANALYSIS_FILES) {
+            const fp = path.join(nupDir, f);
+            if (fs.existsSync(fp)) { fs.rmSync(fp); erased++; }
+          }
+        }
+      }
+      return { erased };
+    }
+  };
+
+  const doEraseAndStart = () => {
+    const { erased } = eraseFiles();
+    addLogLine(agent, `🗑 Erased ${erased} file(s). Starting fresh…`, "system");
+    logBuffers[agent] = [logBuffers[agent][logBuffers[agent].length - 1]]; // keep the erase log line
+    startAgentProcess(agent);
+  };
+
+  if (agentState[agent].running) {
+    addLogLine(agent, "🔄 Erase+Restart requested — stopping current process…", "system");
+    stopAgentProcess(agent);
+    agentState[agent].process!.once("close", () => doEraseAndStart());
+  } else {
+    doEraseAndStart();
   }
 
   return res.json({ ok: true });
