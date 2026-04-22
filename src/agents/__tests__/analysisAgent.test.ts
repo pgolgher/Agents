@@ -20,6 +20,7 @@ import {
   detectEvidenceWithVision,
   createEvidencePdf,
   isUsageLimitError,
+  classifyPage,
   EvidenceMatch,
   VisionMatch,
 } from "../analysisAgent";
@@ -505,7 +506,9 @@ describe("detectEvidenceWithVision", () => {
       fakePdfPath,
       "PROVA_DOC_LIST",
       new Map(),
-      new Map()
+      new Map(),
+      [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+      tmpDir
     );
     expect(matches).toHaveLength(0);
   });
@@ -537,7 +540,9 @@ describe("detectEvidenceWithVision", () => {
       fakePdfPath,
       "PROVA_DOCS",
       anexoByPage,
-      docByAnexo
+      docByAnexo,
+      [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+      tmpDir
     );
 
     expect(matches).toHaveLength(2);
@@ -573,7 +578,7 @@ describe("detectEvidenceWithVision", () => {
       ],
     });
 
-    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map());
+    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], tmpDir);
     expect(matches[0].definitive).toBe(false);
   });
 
@@ -593,7 +598,7 @@ describe("detectEvidenceWithVision", () => {
       ],
     });
 
-    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map());
+    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], tmpDir);
     // Page 5 should appear only once
     expect(matches.filter((m) => m.pageIndex === 4)).toHaveLength(1);
     expect(matches.find((m) => m.pageIndex === 4)?.evidenceType).toBe("CTPS");
@@ -603,7 +608,7 @@ describe("detectEvidenceWithVision", () => {
     const createMock = getAnthropicMock();
     createMock.mockRejectedValueOnce(new Error('400 {"type":"error","error":{"type":"invalid_request_error","message":"Could not process PDF"}}'));
 
-    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map());
+    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], tmpDir);
     expect(matches).toHaveLength(0);
   });
 
@@ -628,7 +633,7 @@ describe("detectEvidenceWithVision", () => {
     // Speed up the test — use fake timers and drain all async timers
     jest.useFakeTimers();
     try {
-      const matchesPromise = detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map());
+      const matchesPromise = detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], tmpDir);
       // Advance timers past the 15s backoff sleep
       await jest.runAllTimersAsync();
       const matches = await matchesPromise;
@@ -656,7 +661,7 @@ describe("detectEvidenceWithVision", () => {
       ],
     });
 
-    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map());
+    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], tmpDir);
     const indices = matches.map((m) => m.pageIndex);
     expect(indices).toEqual([...indices].sort((a, b) => a - b));
   });
@@ -667,7 +672,7 @@ describe("detectEvidenceWithVision", () => {
       content: [{ type: "tool_use", id: "x", name: "y", input: {} }],
     });
 
-    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map());
+    const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], tmpDir);
     expect(matches).toHaveLength(0);
   });
 
@@ -678,7 +683,7 @@ describe("detectEvidenceWithVision", () => {
     );
 
     await expect(
-      detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map())
+      detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], tmpDir)
     ).rejects.toThrow("USAGE_LIMIT");
   });
 
@@ -697,7 +702,7 @@ describe("detectEvidenceWithVision", () => {
       // is attached before the fake-timer advance causes the promise to reject.
       await Promise.all([
         expect(
-          detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map())
+          detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], tmpDir)
         ).rejects.toThrow("USAGE_LIMIT"),
         jest.runAllTimersAsync(),
       ]);
@@ -742,6 +747,97 @@ describe("isUsageLimitError", () => {
 
   it("returns false for a server error unrelated to limits", () => {
     expect(isUsageLimitError("500 Internal Server Error")).toBe(false);
+  });
+});
+
+// ─── classifyPage ──────────────────────────────────────────────────────────────
+
+describe("classifyPage", () => {
+  // ── skip keywords ──────────────────────────────────────────────────────────
+  it("returns 'skip' for CITAÇÃO", () => {
+    expect(classifyPage("CITAÇÃO.pdf")).toBe("skip");
+  });
+
+  it("returns 'skip' for PESQUISA DE BENS (case-insensitive)", () => {
+    expect(classifyPage("pesquisa de bens.pdf")).toBe("skip");
+  });
+
+  it("returns 'skip' for LAUDO MÉDICO", () => {
+    expect(classifyPage("LAUDO MÉDICO.pdf")).toBe("skip");
+  });
+
+  it("returns 'skip' for DECISÃO", () => {
+    expect(classifyPage("DECISÃO.pdf")).toBe("skip");
+  });
+
+  it("returns 'skip' for PETIÇÃO INICIAL", () => {
+    expect(classifyPage("PETIÇÃO INICIAL.pdf")).toBe("skip");
+  });
+
+  it("returns 'skip' for PROCURAÇÃO", () => {
+    expect(classifyPage("PROCURAÇÃO.pdf")).toBe("skip");
+  });
+
+  it("returns 'skip' for TEXTO DIGITADO", () => {
+    expect(classifyPage("TEXTO DIGITADO.pdf")).toBe("skip");
+  });
+
+  it("returns 'skip' for SITUAÇÃO CADASTRAL DO CPF", () => {
+    expect(classifyPage("SITUAÇÃO CADASTRAL DO CPF.pdf")).toBe("skip");
+  });
+
+  // ── confirm keywords ────────────────────────────────────────────────────────
+  it("returns 'confirm' for ITR document", () => {
+    expect(classifyPage("RECIBO DE ITR.pdf")).toBe("confirm");
+  });
+
+  it("returns 'confirm' for CCIR document", () => {
+    expect(classifyPage("CERTIFICADO CCIR.pdf")).toBe("confirm");
+  });
+
+  it("returns 'confirm' for PRONAF document", () => {
+    expect(classifyPage("DOCUMENTO DE ACESSO AO PRONAF.pdf")).toBe("confirm");
+  });
+
+  it("returns 'confirm' for SINDICATO document", () => {
+    expect(classifyPage("FICHA SINDICATO DOS TRABALHADORES RURAIS.pdf")).toBe("confirm");
+  });
+
+  it("returns 'confirm' for PESCADOR document", () => {
+    expect(classifyPage("CARTEIRA DE PESCADOR ARTESANAL.pdf")).toBe("confirm");
+  });
+
+  it("returns 'confirm' for CAF document", () => {
+    expect(classifyPage("EXTRATO CAF.pdf")).toBe("confirm");
+  });
+
+  // ── vision fallback ─────────────────────────────────────────────────────────
+  it("returns 'vision' for CERTIDÃO DE NASCIMENTO (needs visual check)", () => {
+    expect(classifyPage("CERTIDÃO DE NASCIMENTO.pdf")).toBe("vision");
+  });
+
+  it("returns 'vision' for CERTIDÃO DE CASAMENTO (needs visual check)", () => {
+    expect(classifyPage("CERTIDÃO DE CASAMENTO.pdf")).toBe("vision");
+  });
+
+  it("returns 'vision' for PRONTUÁRIO MÉDICO (needs visual check)", () => {
+    expect(classifyPage("PRONTUÁRIO MÉDICO.pdf")).toBe("vision");
+  });
+
+  it("returns 'vision' for CADERNETA DE VACINA (needs visual check)", () => {
+    expect(classifyPage("CADERNETA DE VACINA.pdf")).toBe("vision");
+  });
+
+  it("returns 'vision' for undefined (no Anexo ID — conservative fallback)", () => {
+    expect(classifyPage(undefined)).toBe("vision");
+  });
+
+  it("returns 'vision' for empty string", () => {
+    expect(classifyPage("")).toBe("vision");
+  });
+
+  it("returns 'vision' for unknown document type", () => {
+    expect(classifyPage("DOCUMENTO DESCONHECIDO.pdf")).toBe("vision");
   });
 });
 

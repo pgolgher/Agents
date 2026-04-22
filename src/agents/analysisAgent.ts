@@ -47,19 +47,18 @@ export function isUsageLimitError(errMessage: string): boolean {
 }
 
 /**
- * Maximum pages to send to Claude in a single API call.
- * Claude can handle ~100 pages but smaller chunks give better accuracy
- * and avoid hitting token/size limits.
+ * Maximum pages to send to Claude in a single vision API call.
+ * Smaller chunks (20 pages ≈ 30K tokens) are cheaper, faster, and
+ * less likely to hit TPM limits than the previous 60-page chunks.
  */
-const MAX_PAGES_PER_CHUNK = 60;
+const MAX_PAGES_PER_CHUNK = 20;
 
 /**
- * Milliseconds to wait between vision API calls.
- * The org rate limit is 30,000 input tokens/minute for claude-opus-4-5.
- * Each 60-page vision chunk uses ~15,000-30,000 tokens, so we need to
- * wait ≥60 s between calls to avoid 429 errors.
+ * Model used exclusively for vision-based evidence detection (structured JSON extraction).
+ * Haiku is ~19× cheaper than Opus for this task and handles it well.
+ * The verdict generation uses the user-selected LUAI_MODEL instead.
  */
-const INTER_CHUNK_DELAY_MS = 65_000;
+const VISION_MODEL = "claude-haiku-4-5-20251001";
 
 /** Maximum number of retries for rate-limited requests */
 const MAX_RETRIES = 4;
@@ -83,6 +82,67 @@ export interface EvidenceMatch {
 /** Current version tag — used to invalidate old keyword-based manifests */
 const ANALYSIS_VERSION = "vision-v1";
 
+/**
+ * Filename for the per-NUP vision chunk cache.
+ * Allows resuming a partially-completed vision run without re-calling the API.
+ */
+const VISION_CACHE_FILE = "_vision_cache.json";
+
+// ─── Page classification ───────────────────────────────────────────────────────
+
+/**
+ * Classifies a page based on its Anexo document name to avoid sending
+ * obviously non-evidence or trivially-confirmed pages to the vision API.
+ *
+ * - "skip"    → document is never rural evidence (CITAÇÃO, PESQUISA, etc.) — exclude entirely
+ * - "confirm" → document is always evidence by its very existence (ITR, CCIR, PRONAF, etc.)
+ *               — add directly to matches without any API call
+ * - "vision"  → ambiguous or unknown — must be inspected visually
+ *
+ * Exported for unit testing.
+ */
+export function classifyPage(docName: string | undefined): "skip" | "confirm" | "vision" {
+  if (!docName) return "vision";
+  const upper = docName.toUpperCase();
+
+  const SKIP_KEYWORDS = [
+    "CITAÇÃO", "CITACAO",
+    "PESQUISA",
+    "LAUDO",
+    "DECISÃO", "DECISAO",
+    "PETIÇÃO", "PETICAO",
+    "PROCURAÇÃO", "PROCURACAO",
+    "TEXTO DIGITADO",
+    "DESPACHO",
+    "PORTARIA",
+    "EDITAL",
+    "SITUAÇÃO CADASTRAL", "SITUACAO CADASTRAL",
+    "CERTIDÃO DE REGULARIDADE", "CERTIDAO DE REGULARIDADE",
+  ];
+
+  const CONFIRM_KEYWORDS = [
+    "ITR",
+    "CCIR",
+    "PRONAF",
+    // "CAR" matches CCIR/SINDICATO keywords but is short — check specifically
+    " CAR ", " CAR.", " CAR\n",
+    "CADASTRO AMBIENTAL RURAL",
+    "CAF",
+    "SINDICATO",
+    "PESCADOR",
+  ];
+
+  for (const kw of SKIP_KEYWORDS) {
+    if (upper.includes(kw)) return "skip";
+  }
+  for (const kw of CONFIRM_KEYWORDS) {
+    // For multi-word confirm keywords just use includes; for short ones like ITR/CCIR
+    // they are already distinctive enough
+    if (upper.includes(kw.trim())) return "confirm";
+  }
+  return "vision";
+}
+
 interface AnalysisManifest {
   version: string;
   nup: string;
@@ -97,6 +157,17 @@ interface AnalysisManifest {
 interface PageSpec {
   pdfPath: string;
   pageIndex: number;
+}
+
+interface VisionCacheEntry {
+  startPageIndex: number;
+  pageCount: number;
+  matches: EvidenceMatch[];
+}
+
+interface VisionCache {
+  version: string;
+  chunks: VisionCacheEntry[];
 }
 
 /** Raw match returned by Claude's vision JSON response */
@@ -202,47 +273,6 @@ export function parseAnexoMaps(
   return { anexoByPage, docByAnexo };
 }
 
-// ─── PDF chunk splitting ───────────────────────────────────────────────────────
-
-interface PdfChunk {
-  buffer: Buffer;
-  startPageIndex: number; // 0-based index of first page in original PDF
-  pageCount: number;
-}
-
-/**
- * Splits a PDF buffer into chunks of at most maxPagesPerChunk pages.
- * Each chunk is a self-contained PDF buffer.
- * Returns an array of chunks with the 0-based start page index.
- */
-async function splitPdfIntoChunks(
-  pdfBuffer: Buffer,
-  maxPagesPerChunk: number
-): Promise<PdfChunk[]> {
-  const srcDoc = await PDFDocument.load(pdfBuffer);
-  const totalPages = srcDoc.getPageCount();
-
-  if (totalPages <= maxPagesPerChunk) {
-    return [{ buffer: pdfBuffer, startPageIndex: 0, pageCount: totalPages }];
-  }
-
-  const chunks: PdfChunk[] = [];
-  for (let start = 0; start < totalPages; start += maxPagesPerChunk) {
-    const end = Math.min(start + maxPagesPerChunk, totalPages);
-    const chunkDoc = await PDFDocument.create();
-    const indices = Array.from({ length: end - start }, (_, i) => start + i);
-    const copiedPages = await chunkDoc.copyPages(srcDoc, indices);
-    copiedPages.forEach((p) => chunkDoc.addPage(p));
-    const bytes = await chunkDoc.save();
-    chunks.push({
-      buffer: Buffer.from(bytes),
-      startPageIndex: start,
-      pageCount: end - start,
-    });
-  }
-  return chunks;
-}
-
 // ─── Vision-based evidence detection ─────────────────────────────────────────
 
 /**
@@ -335,46 +365,116 @@ export function parseVisionResponse(responseText: string): VisionMatch[] {
 
 /**
  * Detects evidence of rural activity in a PDF using Claude's vision API.
- * The PDF is sent page-by-page if large, otherwise as a whole document.
  *
- * Returns EvidenceMatch objects (one per page that is part of an evidence document).
- * Multiple pages belonging to the same evidence document are each included.
+ * Only pages listed in `visionPageIndices` are sent to the API (pre-filtered by
+ * classifyPage to exclude non-evidence and auto-confirmed pages). Chunks are built
+ * from contiguous runs of those filtered pages to keep sub-PDFs coherent.
+ *
+ * Results are cached in `_vision_cache.json` inside the NUP folder so that a
+ * partially-completed run can be resumed without re-calling the API.
+ *
+ * Returns EvidenceMatch objects for every matched page (one entry per page).
  */
 export async function detectEvidenceWithVision(
   pdfPath: string,
   provaDocumental: string,
   anexoByPage: Map<number, string>,
-  docByAnexo: Map<string, string>
+  docByAnexo: Map<string, string>,
+  visionPageIndices: number[],
+  cacheDir: string
 ): Promise<EvidenceMatch[]> {
   const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-  const pdfBuffer = fs.readFileSync(pdfPath);
-  const chunks = await splitPdfIntoChunks(pdfBuffer, MAX_PAGES_PER_CHUNK);
+
+  // ── Load existing chunk cache ──────────────────────────────────────────────
+  const cachePath = path.join(cacheDir, VISION_CACHE_FILE);
+  let cache: VisionCache = { version: ANALYSIS_VERSION, chunks: [] };
+  if (fs.existsSync(cachePath)) {
+    try {
+      const loaded = JSON.parse(fs.readFileSync(cachePath, "utf-8")) as VisionCache;
+      if (loaded.version === ANALYSIS_VERSION) cache = loaded;
+    } catch {
+      // Corrupt cache — start fresh
+    }
+  }
+
+  // ── Build chunks from the filtered page list ───────────────────────────────
+  // Sort and deduplicate the vision page indices
+  const sortedIndices = [...new Set(visionPageIndices)].sort((a, b) => a - b);
+
+  if (sortedIndices.length === 0) return [];
+
+  // Group into contiguous runs then split at MAX_PAGES_PER_CHUNK
+  const pageGroups: number[][] = [];
+  let current: number[] = [sortedIndices[0]];
+  for (let i = 1; i < sortedIndices.length; i++) {
+    if (sortedIndices[i] === sortedIndices[i - 1] + 1) {
+      current.push(sortedIndices[i]);
+    } else {
+      pageGroups.push(current);
+      current = [sortedIndices[i]];
+    }
+  }
+  pageGroups.push(current);
+
+  // Flatten into MAX_PAGES_PER_CHUNK-sized page-index lists
+  const chunkPageLists: number[][] = [];
+  for (const group of pageGroups) {
+    for (let i = 0; i < group.length; i += MAX_PAGES_PER_CHUNK) {
+      chunkPageLists.push(group.slice(i, i + MAX_PAGES_PER_CHUNK));
+    }
+  }
+
+  // ── Load the source PDF once ───────────────────────────────────────────────
+  const srcDoc = await PDFDocument.load(fs.readFileSync(pdfPath));
+
   const allMatches: EvidenceMatch[] = [];
   const seenPageIndices = new Set<number>();
 
-  for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx++) {
-    const chunk = chunks[chunkIdx];
+  for (let chunkIdx = 0; chunkIdx < chunkPageLists.length; chunkIdx++) {
+    const pageList = chunkPageLists[chunkIdx];
+    const startPageIndex = pageList[0];
+    const pageCount = pageList.length;
 
-    // Polite delay between chunks to stay within rate limits
-    if (chunkIdx > 0) await sleep(INTER_CHUNK_DELAY_MS);
+    // ── Check cache ──────────────────────────────────────────────────────────
+    const cached = cache.chunks.find(
+      (c) => c.startPageIndex === startPageIndex && c.pageCount === pageCount
+    );
+    if (cached) {
+      console.log(`    💾 Cache hit: chunk pages ${startPageIndex + 1}–${startPageIndex + pageCount}`);
+      for (const m of cached.matches) {
+        if (!seenPageIndices.has(m.pageIndex)) {
+          seenPageIndices.add(m.pageIndex);
+          allMatches.push(m);
+        }
+      }
+      continue;
+    }
 
-    const base64 = chunk.buffer.toString("base64");
-    const prompt = buildVisionPrompt(provaDocumental, chunk.startPageIndex);
+    // ── Build sub-PDF from the filtered page list ────────────────────────────
+    const chunkDoc = await PDFDocument.create();
+    const copiedPages = await chunkDoc.copyPages(srcDoc, pageList);
+    copiedPages.forEach((p) => chunkDoc.addPage(p));
+    const chunkBytes = await chunkDoc.save();
+    const base64 = Buffer.from(chunkBytes).toString("base64");
+
+    // The prompt sees chunk-relative page numbers (1-based), but we annotate
+    // the note with the original page range for clarity
+    const prompt = buildVisionPrompt(provaDocumental, startPageIndex);
 
     let responseText: string | null = null;
     let lastErr: string = "";
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
-        // Exponential backoff: 15s, 30s, 60s, 120s
+        // Exponential backoff: 15s, 30s, 60s, 120s — only on actual 429s
         const waitMs = 15_000 * Math.pow(2, attempt - 1);
-        console.warn(`    ⏳ Rate limited — retrying chunk starting at page ${chunk.startPageIndex + 1} in ${waitMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES + 1})…`);
+        console.warn(`    ⏳ Rate limited — retrying chunk starting at page ${startPageIndex + 1} in ${waitMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES + 1})…`);
         await sleep(waitMs);
       }
 
       try {
         const response = await anthropic.messages.create({
-          model: process.env.LUAI_MODEL ?? config.model,
+          model: VISION_MODEL,
           max_tokens: 2048,
           messages: [
             {
@@ -413,41 +513,52 @@ export async function detectEvidenceWithVision(
         const isRateLimit =
           lastErr.includes("429") || lastErr.toLowerCase().includes("rate_limit");
         if (!isRateLimit || attempt === MAX_RETRIES) {
-          console.error(`    ❌ Vision API error for chunk starting at page ${chunk.startPageIndex + 1}: ${lastErr}`);
+          console.error(`    ❌ Vision API error for chunk starting at page ${startPageIndex + 1}: ${lastErr}`);
           break;
         }
         // Will retry
       }
     }
 
-    if (responseText === null) continue;
+    const chunkMatches: EvidenceMatch[] = [];
 
-    const visionMatches = parseVisionResponse(responseText);
+    if (responseText !== null) {
+      const visionMatches = parseVisionResponse(responseText);
 
-    for (const vm of visionMatches) {
-      for (const chunkPageNum of vm.pages) {
-        // Convert chunk-relative 1-based page number to 0-based original page index
-        const pageIndex = chunk.startPageIndex + chunkPageNum - 1;
+      for (const vm of visionMatches) {
+        for (const chunkPageNum of vm.pages) {
+          // chunkPageNum is 1-based within the sub-PDF (which only has pageList pages)
+          const listIdx = chunkPageNum - 1;
+          if (listIdx < 0 || listIdx >= pageList.length) continue;
 
-        // Bounds check
-        if (pageIndex < 0) continue;
+          const pageIndex = pageList[listIdx];
 
-        // Deduplicate: keep first match per page
-        if (seenPageIndices.has(pageIndex)) continue;
-        seenPageIndices.add(pageIndex);
+          if (seenPageIndices.has(pageIndex)) continue;
+          seenPageIndices.add(pageIndex);
 
-        const anexoId = anexoByPage.get(pageIndex);
-        allMatches.push({
-          sourceFile: pdfPath,
-          pageIndex,
-          pageNumber: pageIndex + 1,
-          anexoId,
-          documentName: anexoId ? docByAnexo.get(anexoId) : undefined,
-          evidenceType: vm.documentType,
-          definitive: vm.confidence === "high",
-          excerpt: vm.qualifyingContent,
-        });
+          const anexoId = anexoByPage.get(pageIndex);
+          const match: EvidenceMatch = {
+            sourceFile: pdfPath,
+            pageIndex,
+            pageNumber: pageIndex + 1,
+            anexoId,
+            documentName: anexoId ? docByAnexo.get(anexoId) : undefined,
+            evidenceType: vm.documentType,
+            definitive: vm.confidence === "high",
+            excerpt: vm.qualifyingContent,
+          };
+          chunkMatches.push(match);
+          allMatches.push(match);
+        }
       }
+    }
+
+    // ── Write cache entry ────────────────────────────────────────────────────
+    cache.chunks.push({ startPageIndex, pageCount, matches: chunkMatches });
+    try {
+      fs.writeFileSync(cachePath, JSON.stringify(cache, null, 2), "utf-8");
+    } catch {
+      // Cache write failure is non-fatal
     }
   }
 
@@ -788,11 +899,53 @@ async function analyzeProcess(folderPath: string): Promise<void> {
     const pageTexts = allPageTexts.get(pdfPath)!;
     const pageCount = pageTexts.length;
 
-    console.log(`    → Vision: ${path.basename(pdfPath)} (${pageCount} pages)…`);
+    // ── Pre-classify pages to avoid unnecessary vision calls ────────────────
+    const visionPageIndices: number[] = [];
+    let skipped = 0;
+    let confirmed = 0;
+
+    for (let i = 0; i < pageCount; i++) {
+      const anexoId = anexoByPage.get(i);
+      const docName = anexoId ? docByAnexo.get(anexoId) : undefined;
+      const cls = classifyPage(docName);
+
+      if (cls === "skip") {
+        skipped++;
+      } else if (cls === "confirm") {
+        confirmed++;
+        // Add as high-confidence evidence without a vision call
+        allMatches.push({
+          sourceFile: pdfPath,
+          pageIndex: i,
+          pageNumber: i + 1,
+          anexoId,
+          documentName: docName,
+          evidenceType: docName ?? "Documento rural confirmado",
+          definitive: true,
+          excerpt: "Tipo de documento confirmado automaticamente pelo índice",
+        });
+      } else {
+        visionPageIndices.push(i);
+      }
+    }
+
+    if (skipped > 0 || confirmed > 0) {
+      console.log(`    → Pre-filter: ${skipped} page(s) skipped (non-evidence), ${confirmed} confirmed without vision, ${visionPageIndices.length} sent to vision`);
+    }
+
+    console.log(`    → Vision: ${path.basename(pdfPath)} (${visionPageIndices.length}/${pageCount} pages)…`);
     let matches: EvidenceMatch[];
     try {
-      matches = await detectEvidenceWithVision(pdfPath, provaDocumental, anexoByPage, docByAnexo);
+      matches = await detectEvidenceWithVision(
+        pdfPath,
+        provaDocumental,
+        anexoByPage,
+        docByAnexo,
+        visionPageIndices,
+        folderPath
+      );
     } catch (err: any) {
+      if (isUsageLimitError(err.message ?? "")) throw err;
       console.error(`    ❌ Vision error: ${err.message}`);
       matches = [];
     }
