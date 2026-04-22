@@ -14,6 +14,7 @@ import {
   extractPdfBuffer,
   isPapGetInss,
   shouldSkipTask,
+  isReauthError,
 } from "../downloadAgent";
 
 // ── fixFileName ────────────────────────────────────────────────────────────────
@@ -335,5 +336,42 @@ describe("PDF decode round-trip", () => {
 
     expect(decoded).toHaveLength(largeFakePdf.length);
     expect(decoded).toEqual(largeFakePdf);
+  });
+});
+
+// ── isReauthError ──────────────────────────────────────────────────────────────
+
+describe("isReauthError", () => {
+  it("returns true for an axios error with status 401", () => {
+    const err = { response: { status: 401 } };
+    expect(isReauthError(err)).toBe(true);
+  });
+
+  it("returns false for a 403 Forbidden", () => {
+    expect(isReauthError({ response: { status: 403 } })).toBe(false);
+  });
+
+  it("returns false for a 429 rate-limit error", () => {
+    expect(isReauthError({ response: { status: 429 } })).toBe(false);
+  });
+
+  it("returns false for a 500 server error", () => {
+    expect(isReauthError({ response: { status: 500 } })).toBe(false);
+  });
+
+  it("returns false for a network error (no response object)", () => {
+    expect(isReauthError({ code: "ECONNREFUSED" })).toBe(false);
+  });
+
+  it("returns false for null", () => {
+    expect(isReauthError(null)).toBe(false);
+  });
+
+  it("returns false for a plain Error without response", () => {
+    expect(isReauthError(new Error("network failure"))).toBe(false);
+  });
+
+  it("returns false for undefined", () => {
+    expect(isReauthError(undefined)).toBe(false);
   });
 });

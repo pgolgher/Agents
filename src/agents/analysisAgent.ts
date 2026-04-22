@@ -32,6 +32,21 @@ const VERDICT_FILE = "VERIDICT.md";
 const ANALYSIS_MANIFEST = "_analysis.json";
 
 /**
+ * Returns true when an Anthropic API error represents a hard account-level
+ * usage cap (HTTP 400 "You have reached your specified API usage limits").
+ * Unlike 429 rate limits, these cannot be resolved by waiting — the user
+ * must increase their limit at console.anthropic.com.
+ * Exported for unit testing.
+ */
+export function isUsageLimitError(errMessage: string): boolean {
+  return (
+    errMessage.includes("API usage limits") ||
+    errMessage.includes("specified API usage limits") ||
+    errMessage.includes("usage limit")
+  );
+}
+
+/**
  * Maximum pages to send to Claude in a single API call.
  * Claude can handle ~100 pages but smaller chunks give better accuracy
  * and avoid hitting token/size limits.
@@ -391,6 +406,10 @@ export async function detectEvidenceWithVision(
         break; // success
       } catch (err: any) {
         lastErr = err.message ?? String(err);
+        // Hard account-level usage cap — retrying won't help, abort the run
+        if (isUsageLimitError(lastErr)) {
+          throw new Error(`USAGE_LIMIT: ${lastErr}`);
+        }
         const isRateLimit =
           lastErr.includes("429") || lastErr.toLowerCase().includes("rate_limit");
         if (!isRateLimit || attempt === MAX_RETRIES) {
@@ -824,6 +843,7 @@ async function analyzeProcess(folderPath: string): Promise<void> {
     console.log(`  ✅ VERIDICT.md written`);
     verdictWritten = true;
   } catch (err: any) {
+    if (isUsageLimitError(err.message ?? "")) throw err; // propagate — abort the run
     console.error(`  ❌ Verdict generation failed: ${err.message}`);
     const evidenceList =
       allMatches.length > 0
@@ -886,6 +906,16 @@ async function main(): Promise<void> {
       await analyzeProcess(folder);
       analyzed++;
     } catch (err: any) {
+      if (isUsageLimitError(err.message ?? "")) {
+        // Extract the reset date from the error message if present
+        const resetMatch = (err.message as string).match(/\d{4}-\d{2}-\d{2}/);
+        const resetInfo = resetMatch ? ` Access resumes: ${resetMatch[0]}.` : "";
+        console.error(
+          `\n❌ Anthropic API usage limit reached — agent stopped.${resetInfo}` +
+          `\n   Increase your limit at: https://console.anthropic.com/settings/limits`
+        );
+        break;
+      }
       console.error(`  ❌ Unhandled error: ${err.message}`);
       errors++;
     }

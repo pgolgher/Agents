@@ -19,6 +19,7 @@ import {
   buildVisionPrompt,
   detectEvidenceWithVision,
   createEvidencePdf,
+  isUsageLimitError,
   EvidenceMatch,
   VisionMatch,
 } from "../analysisAgent";
@@ -668,6 +669,79 @@ describe("detectEvidenceWithVision", () => {
 
     const matches = await detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map());
     expect(matches).toHaveLength(0);
+  });
+
+  it("throws USAGE_LIMIT error when API returns account usage cap (400)", async () => {
+    const createMock = getAnthropicMock();
+    createMock.mockRejectedValueOnce(
+      new Error('400 {"type":"error","error":{"type":"invalid_request_error","message":"You have reached your specified API usage limits. You will regain access on 2026-05-01 at 00:00 UTC."}}')
+    );
+
+    await expect(
+      detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map())
+    ).rejects.toThrow("USAGE_LIMIT");
+  });
+
+  it("throws USAGE_LIMIT regardless of which attempt hits the cap", async () => {
+    const createMock = getAnthropicMock();
+    // First attempt: transient rate limit
+    createMock.mockRejectedValueOnce(new Error("429 rate_limit exceeded"));
+    // Second attempt: usage cap
+    createMock.mockRejectedValueOnce(
+      new Error("400 You have reached your specified API usage limits.")
+    );
+
+    jest.useFakeTimers();
+    try {
+      // Run timers and the assertion concurrently so the rejection handler
+      // is attached before the fake-timer advance causes the promise to reject.
+      await Promise.all([
+        expect(
+          detectEvidenceWithVision(fakePdfPath, "DOCS", new Map(), new Map())
+        ).rejects.toThrow("USAGE_LIMIT"),
+        jest.runAllTimersAsync(),
+      ]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+// ─── isUsageLimitError ─────────────────────────────────────────────────────────
+
+describe("isUsageLimitError", () => {
+  it("returns true for exact Anthropic usage-limit message", () => {
+    expect(
+      isUsageLimitError("You have reached your specified API usage limits. You will regain access on 2026-05-01")
+    ).toBe(true);
+  });
+
+  it("returns true for 'API usage limits' substring", () => {
+    expect(isUsageLimitError("400: API usage limits exceeded")).toBe(true);
+  });
+
+  it("returns true for 'usage limit' (lowercase)", () => {
+    expect(isUsageLimitError("account usage limit reached")).toBe(true);
+  });
+
+  it("returns false for a generic 400 error unrelated to usage", () => {
+    expect(isUsageLimitError("400 Could not process PDF")).toBe(false);
+  });
+
+  it("returns false for a 429 rate-limit message", () => {
+    expect(isUsageLimitError("429 rate_limit_exceeded")).toBe(false);
+  });
+
+  it("returns false for an empty string", () => {
+    expect(isUsageLimitError("")).toBe(false);
+  });
+
+  it("returns false for a network error message", () => {
+    expect(isUsageLimitError("ECONNRESET socket hang up")).toBe(false);
+  });
+
+  it("returns false for a server error unrelated to limits", () => {
+    expect(isUsageLimitError("500 Internal Server Error")).toBe(false);
   });
 });
 

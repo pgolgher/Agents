@@ -130,18 +130,23 @@ interface TaskManifest {
   skipReason?: string;
 }
 
-// ── Main ───────────────────────────────────────────────────────────────────────
+// ── Auth helpers ───────────────────────────────────────────────────────────────
 
-export async function downloadTarefas(): Promise<TaskManifest[]> {
-  const email = process.env.AGU_EMAIL;
-  const senha = process.env.AGU_SENHA;
-  if (!email || !senha) {
-    throw new Error("AGU_EMAIL and AGU_SENHA must be set in .env");
-  }
+/**
+ * Returns true when an axios error should trigger a JWT re-authentication.
+ * Exported for unit testing.
+ */
+export function isReauthError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as Record<string, any>;
+  return e.response?.status === 401;
+}
 
-  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-
-  // ── Step 1: Login and extract JWT ─────────────────────────────────────────
+/**
+ * Opens a browser, logs in with the supplied credentials, extracts the JWT
+ * from localStorage/sessionStorage and returns it. Exported for testing.
+ */
+export async function performLogin(email: string, senha: string): Promise<string> {
   console.log("\n[DownloadAgent] Opening browser for login…");
   const browser = await chromium.launch({ headless: false, slowMo: 100 });
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
@@ -190,6 +195,22 @@ export async function downloadTarefas(): Promise<TaskManifest[]> {
 
   if (!jwtToken) throw new Error("JWT not found in localStorage after login");
   console.log(`[DownloadAgent] JWT extracted (${jwtToken.length} chars). Browser closed.`);
+  return jwtToken;
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────────
+
+export async function downloadTarefas(): Promise<TaskManifest[]> {
+  const email = process.env.AGU_EMAIL;
+  const senha = process.env.AGU_SENHA;
+  if (!email || !senha) {
+    throw new Error("AGU_EMAIL and AGU_SENHA must be set in .env");
+  }
+
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+  // ── Step 1: Login and extract JWT ─────────────────────────────────────────
+  let jwtToken = await performLogin(email, senha);
 
   // ── Step 2: Build axios client with JWT ───────────────────────────────────
   const api: AxiosInstance = axios.create({
@@ -200,6 +221,24 @@ export async function downloadTarefas(): Promise<TaskManifest[]> {
     },
     timeout: 600_000, // 10 min — large PDFs are returned as 13 MB base64 JSON
   });
+
+  // ── Interceptor: re-authenticate on 401 (JWT expiry) ──────────────────────
+  // When the JWT expires mid-run the server returns 401. We re-login once per
+  // request (guarded by _retried) to get a fresh token, then retry.
+  api.interceptors.response.use(
+    (response) => response,
+    async (error) => {
+      if (isReauthError(error) && !error.config._retried) {
+        error.config._retried = true;
+        console.log("[DownloadAgent] 🔑 JWT expired — re-authenticating…");
+        jwtToken = await performLogin(email, senha);
+        api.defaults.headers.common["Authorization"] = `Bearer ${jwtToken}`;
+        error.config.headers["Authorization"] = `Bearer ${jwtToken}`;
+        return api(error.config);
+      }
+      return Promise.reject(error);
+    }
+  );
 
   // ── Step 3: Get current user ──────────────────────────────────────────────
   const profileResp = await api.get("/profile");
